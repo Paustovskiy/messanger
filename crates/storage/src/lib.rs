@@ -13,8 +13,10 @@ pub struct Db {
 pub struct IdentityRow {
     pub account_id: String,          // UUID (внутренний ID)
     pub username: Option<String>,    // @username (человекочитаемый, опционально)
-    pub secret: [u8; 32],
-    pub public: [u8; 32],
+    pub secret: [u8; 32],       // x25519 secret
+    pub public: [u8; 32],       // x25519 public
+    pub sign_secret: [u8; 32],  // ed25519 signing secret
+    pub sign_public: [u8; 32],  // ed25519 verifying public
 }
 #[derive(Debug, Clone)]
 pub struct ContactRow {
@@ -92,35 +94,51 @@ impl Db {
     pub fn get_local_identity(&self) -> Result<Option<IdentityRow>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT account_id, username, secret, public
-            FROM identities
-            ORDER BY created_at ASC
-            LIMIT 1
-            "#,
+        SELECT account_id, username, secret, public, sign_secret, sign_public
+        FROM identities
+        ORDER BY created_at ASC
+        LIMIT 1
+        "#,
         )?;
 
-        let raw: Option<(String, Option<String>, Vec<u8>, Vec<u8>)> = stmt
-            .query_row([], |r| {
+        let raw: Option<(String, Option<String>, Vec<u8>, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)> =
+            stmt.query_row([], |r| {
                 let account_id: String = r.get(0)?;
                 let username: Option<String> = r.get(1)?;
                 let secret: Vec<u8> = r.get(2)?;
                 let public: Vec<u8> = r.get(3)?;
-                Ok((account_id, username, secret, public))
+                let sign_secret: Option<Vec<u8>> = r.get(4)?;
+                let sign_public: Option<Vec<u8>> = r.get(5)?;
+                Ok((account_id, username, secret, public, sign_secret, sign_public))
             })
-            .optional()?;
+                .optional()?;
 
-        let Some((account_id, username, secret_vec, public_vec)) = raw else {
+        let Some((account_id, username, secret_vec, public_vec, sign_secret_vec, sign_public_vec)) = raw else {
             return Ok(None);
         };
 
         let secret = vec32(secret_vec, "secret")?;
         let public = vec32(public_vec, "public")?;
 
+        // Для старых БД sign_* могут быть NULL — caller должен уметь это обработать.
+        // Но storage-level лучше не гадать: если их нет, считаем identity неполной.
+        let sign_secret = match sign_secret_vec {
+            Some(v) => vec32(v, "sign_secret")?,
+            None => return Ok(None),
+        };
+
+        let sign_public = match sign_public_vec {
+            Some(v) => vec32(v, "sign_public")?,
+            None => return Ok(None),
+        };
+
         Ok(Some(IdentityRow {
             account_id,
             username,
             secret,
             public,
+            sign_secret,
+            sign_public,
         }))
     }
 
@@ -130,20 +148,26 @@ impl Db {
 
         self.conn.execute(
             r#"
-            INSERT INTO identities (account_id, username, secret, public, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(account_id) DO UPDATE SET
-                username = excluded.username,
-                secret   = excluded.secret,
-                public   = excluded.public
-            "#,
+        INSERT INTO identities (
+            account_id, username, secret, public, sign_secret, sign_public, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(account_id) DO UPDATE SET
+            username    = excluded.username,
+            secret      = excluded.secret,
+            public      = excluded.public,
+            sign_secret = excluded.sign_secret,
+            sign_public = excluded.sign_public
+        "#,
             params![
-                row.account_id,
-                row.username,
-                row.secret.as_slice(),
-                row.public.as_slice(),
-                now
-            ],
+            row.account_id,
+            row.username,
+            row.secret.as_slice(),
+            row.public.as_slice(),
+            row.sign_secret.as_slice(),
+            row.sign_public.as_slice(),
+            now
+        ],
         )?;
 
         Ok(())
@@ -532,6 +556,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_user_version(conn, 2)?;
         return Ok(());
     }
+    if !column_exists(conn, "identities", "sign_secret")? {
+        conn.execute_batch(r#"ALTER TABLE identities ADD COLUMN sign_secret BLOB NULL;"#)?;
+    }
+    if !column_exists(conn, "identities", "sign_public")? {
+        conn.execute_batch(r#"ALTER TABLE identities ADD COLUMN sign_public BLOB NULL;"#)?;
+    }
 
     // Таблица identities есть. Проверим, старая ли схема (user_id вместо account_id).
     let has_user_id = column_exists(conn, "identities", "user_id")?;
@@ -543,12 +573,14 @@ fn migrate(conn: &Connection) -> Result<()> {
             r#"
             ALTER TABLE identities RENAME TO identities_old;
 
-            CREATE TABLE identities (
+            CREATE TABLE IF NOT EXISTS identities (
                 account_id TEXT PRIMARY KEY,
                 username   TEXT NULL,
-                secret     BLOB NOT NULL,
-                public     BLOB NOT NULL,
-                created_at INTEGER NOT NULL
+                secret      BLOB NOT NULL,
+                public      BLOB NOT NULL,
+                sign_secret BLOB NULL,
+                sign_public BLOB NULL,
+                created_at  INTEGER NOT NULL
             );
 
             INSERT INTO identities (account_id, username, secret, public, created_at)

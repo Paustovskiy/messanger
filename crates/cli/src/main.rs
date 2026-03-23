@@ -184,10 +184,12 @@ fn load_or_create_identity(db: &Db) -> Result<(IdentityRow, Identity)> {
     let id = Identity::generate(&account_id);
 
     let row = IdentityRow {
-        account_id: account_id.clone(),
+        account_id,
         username: None,
         secret: id.secret_bytes(),
         public: id.public_bytes(),
+        sign_secret: id.sign_secret_bytes(),
+        sign_public: id.sign_public_bytes(),
     };
 
     db.upsert_identity(&row)?;

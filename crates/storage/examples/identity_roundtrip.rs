@@ -24,9 +24,11 @@ fn main() -> anyhow::Result<()> {
 
             let row = IdentityRow {
                 account_id,
-                username: None, // потом зададим @username
+                username: None,
                 secret: id.secret_bytes(),
                 public: id.public_bytes(),
+                sign_secret: id.sign_secret_bytes(),
+                sign_public: id.sign_public_bytes(),
             };
 
             db.upsert_identity(&row)?;
