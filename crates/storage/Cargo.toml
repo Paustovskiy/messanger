@@ -1,0 +1,15 @@
+[package]
+name = "storage"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+directories = "5"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+crypto_core = { path = "../crypto_core" }
+protocol = { path = "../protocol" }
+base64 = "0.22"
