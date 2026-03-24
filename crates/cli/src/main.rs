@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crypto_core::Identity;
-use protocol::{normalize_username, ContactCard, EnvelopeB64, UserId};
+use protocol::{normalize_username, ContactCardPayload, ContactCardV2, EnvelopeB64, UserId};
 use storage::{Db, IdentityRow};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
@@ -176,7 +176,11 @@ fn main() -> Result<()> {
 
 fn load_or_create_identity(db: &Db) -> Result<(IdentityRow, Identity)> {
     if let Some(row) = db.get_local_identity()? {
-        let id = Identity::from_secret_bytes(row.account_id.clone(), row.secret);
+        let id = Identity::from_secrets(
+            row.account_id.clone(),
+            row.secret,
+            row.sign_secret,
+        );
         return Ok((row, id));
     }
 
@@ -230,7 +234,25 @@ fn cmd_whoami(db: &Db) -> Result<()> {
 
 fn cmd_export_contact(db: &Db) -> Result<()> {
     let (row, id) = load_or_create_identity(db)?;
-    let card = ContactCard::from_parts(row.account_id, row.username, id.public_bytes());
+
+    let payload = ContactCardPayload {
+        account_id: row.account_id.clone(),
+        username: row.username.clone(),
+        x25519_pub: id.public_bytes(),
+        ed25519_pub: id.sign_public_bytes(),
+    };
+
+    let payload_bytes = protocol::contact_card_payload_bytes(&payload)?;
+    let sig = id.sign(&payload_bytes);
+
+    let card = ContactCardV2::from_parts(
+        row.account_id,
+        row.username,
+        id.public_bytes(),
+        id.sign_public_bytes(),
+        sig,
+    );
+
     let json = serde_json::to_string_pretty(&card)?;
     println!("{}", json);
     Ok(())
@@ -272,9 +294,20 @@ fn cmd_decrypt(db: &Db, envelope: Option<String>, envelope_file: Option<String>)
 
 fn cmd_add_contact(db: &Db, contact: Option<String>, contact_file: Option<String>) -> Result<()> {
     let contact_json = read_input_string(contact, contact_file, "contact")?;
-    let card: ContactCard = serde_json::from_str(&contact_json).context("parse ContactCard JSON")?;
+    let card: ContactCardV2 =
+        serde_json::from_str(&contact_json).context("parse ContactCardV2 JSON")?;
 
-    let public = card.pubkey_bytes()?;
+    let payload = card.signing_payload();
+    let payload_bytes = protocol::contact_card_payload_bytes(&payload)?;
+
+    let ed25519_pub = card.ed25519_pub_bytes()?;
+    let sig = card.sig_bytes()?;
+
+    if !Identity::verify(ed25519_pub, &payload_bytes, sig) {
+        anyhow::bail!("contact card signature verification failed");
+    }
+
+    let public = card.x25519_pub_bytes()?;
     let row = storage::ContactRow {
         account_id: card.account_id.clone(),
         username: card.username.clone(),

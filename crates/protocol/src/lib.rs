@@ -59,12 +59,100 @@ pub struct EnvelopeB64 {
     pub nonce_b64: String,
     pub body_b64: String,
 }
-
+//old struct, not use
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactCard {
     pub account_id: String,               // UUID
     pub username: Option<String>,         // "@name" или None
     pub identity_pubkey_b64: String,      // 32 bytes b64
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContactCardV2 {
+    pub account_id: String,
+    pub username: Option<String>,
+    pub x25519_pub_b64: String,
+    pub ed25519_pub_b64: String,
+    pub sig_b64: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContactCardPayload {
+    pub account_id: String,
+    pub username: Option<String>,
+    pub x25519_pub: [u8; 32],
+    pub ed25519_pub: [u8; 32],
+}
+
+impl ContactCardV2 {
+    pub fn from_parts(
+        account_id: String,
+        username: Option<String>,
+        x25519_pub: [u8; 32],
+        ed25519_pub: [u8; 32],
+        sig: [u8; 64],
+    ) -> Self {
+        Self {
+            account_id,
+            username,
+            x25519_pub_b64: STANDARD_NO_PAD.encode(x25519_pub),
+            ed25519_pub_b64: STANDARD_NO_PAD.encode(ed25519_pub),
+            sig_b64: STANDARD_NO_PAD.encode(sig),
+        }
+    }
+
+    pub fn x25519_pub_bytes(&self) -> anyhow::Result<[u8; 32]> {
+        decode_b64_32(&self.x25519_pub_b64, "x25519_pub_b64")
+    }
+
+    pub fn ed25519_pub_bytes(&self) -> anyhow::Result<[u8; 32]> {
+        decode_b64_32(&self.ed25519_pub_b64, "ed25519_pub_b64")
+    }
+
+    pub fn sig_bytes(&self) -> anyhow::Result<[u8; 64]> {
+        decode_b64_64(&self.sig_b64, "sig_b64")
+    }
+
+    pub fn signing_payload(&self) -> ContactCardPayload {
+        ContactCardPayload {
+            account_id: self.account_id.clone(),
+            username: self.username.clone(),
+            x25519_pub: self.x25519_pub_bytes().expect("valid x25519_pub_b64"),
+            ed25519_pub: self.ed25519_pub_bytes().expect("valid ed25519_pub_b64"),
+        }
+    }
+}
+
+fn decode_b64_32(s: &str, field: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = STANDARD_NO_PAD
+        .decode(s)
+        .map_err(|e| anyhow::anyhow!("invalid base64 in {}: {}", field, e))?;
+
+    if bytes.len() != 32 {
+        anyhow::bail!("invalid {} length: expected 32, got {}", field, bytes.len());
+    }
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn decode_b64_64(s: &str, field: &str) -> anyhow::Result<[u8; 64]> {
+    let bytes = STANDARD_NO_PAD
+        .decode(s)
+        .map_err(|e| anyhow::anyhow!("invalid base64 in {}: {}", field, e))?;
+
+    if bytes.len() != 64 {
+        anyhow::bail!("invalid {} length: expected 64, got {}", field, bytes.len());
+    }
+
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+pub fn contact_card_payload_bytes(payload: &ContactCardPayload) -> anyhow::Result<Vec<u8>> {
+    Ok(bincode::serialize(payload)?)
 }
 
 #[derive(Debug, Error)]
