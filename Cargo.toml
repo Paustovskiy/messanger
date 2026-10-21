@@ -38,8 +38,14 @@ hkdf = "0.12"
 sha2 = "0.10"
 
 # хранилище
-rusqlite = { version = "0.32", features = ["bundled"] }
+# SQLCipher: вся база клиента шифруется. OpenSSL собирается из исходников,
+# чтобы не зависеть от системной библиотеки (Windows, macOS, Linux одинаково).
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 directories = "5"
+argon2 = "0.5"
+zeroize = "1"
+fs4 = { version = "0.13", features = ["sync"] }
+rpassword = "7"
 
 # сеть
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
@@ -51,3 +57,11 @@ dashmap = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Argon2 в отладочной сборке работает в десятки раз медленнее — тесты и `cargo run`
+# ждали бы пароль секундами. Оптимизируем только его.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

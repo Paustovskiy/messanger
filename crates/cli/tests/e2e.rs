@@ -7,6 +7,8 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+const TEST_PASSWORD: &str = "correct horse battery staple";
+
 struct User {
     db: PathBuf,
     relay: String,
@@ -30,6 +32,9 @@ impl User {
         c.env_remove("MESSENGER_PROFILE")
             .env_remove("MESSENGER_RELAY")
             .env_remove("MESSENGER_DB");
+        // Все тестовые базы зашифрованы — как у настоящего пользователя.
+        c.env("MESSENGER_PASSWORD", TEST_PASSWORD)
+            .env_remove("MESSENGER_NEW_PASSWORD");
         c
     }
 
@@ -334,6 +339,144 @@ fn listen_and_send_in_parallel_keep_sessions_consistent() {
     bob.ok(&["send", "@alice", "и тебе", "--wait", "0"]);
     alice.ok(&["sync", "--wait", "1"]);
     assert!(alice.ok(&["chat", "@bobby"]).contains("@bobby: и тебе"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Команда с явно заданными паролями (`None` — переменная не задана).
+fn with_passwords(user: &User, args: &[&str], current: Option<&str>, new: Option<&str>) -> Output {
+    let mut c = user.cmd(args);
+    c.env_remove("MESSENGER_PASSWORD");
+    if let Some(pw) = current {
+        c.env("MESSENGER_PASSWORD", pw);
+    }
+    if let Some(pw) = new {
+        c.env("MESSENGER_NEW_PASSWORD", pw);
+    }
+    c.stdin(Stdio::null()).output().unwrap()
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+#[test]
+fn database_password_lifecycle() {
+    let dir = tmp_dir("passwords");
+    let alice = User::new(&dir, "alice", "ws://127.0.0.1:9/ws");
+    alice.ok(&["init"]);
+    alice.ok(&["set-username", "alice"]);
+    let id = alice
+        .ok(&["whoami"])
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_string();
+
+    // На диске нет ни ID, ни имени.
+    let raw = std::fs::read(&alice.db).unwrap();
+    for needle in [id.as_str(), "@alice"] {
+        assert!(
+            !raw.windows(needle.len()).any(|w| w == needle.as_bytes()),
+            "{needle} on disk"
+        );
+    }
+
+    // Неверный пароль.
+    let out = with_passwords(&alice, &["whoami"], Some("wrong password"), None);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("неверный пароль"), "{}", stderr(&out));
+
+    // Смена пароля: слишком короткий не принимается.
+    let out = with_passwords(
+        &alice,
+        &["set-password"],
+        Some(TEST_PASSWORD),
+        Some("short"),
+    );
+    assert!(
+        stderr(&out).contains("слишком короткий"),
+        "{}",
+        stderr(&out)
+    );
+    let out = with_passwords(
+        &alice,
+        &["set-password"],
+        Some(TEST_PASSWORD),
+        Some("новый длинный пароль"),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !with_passwords(&alice, &["whoami"], Some(TEST_PASSWORD), None)
+            .status
+            .success()
+    );
+    let out = with_passwords(&alice, &["whoami"], Some("новый длинный пароль"), None);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("@alice"));
+
+    // Снять пароль — данные на месте, но клиент предупреждает.
+    let out = with_passwords(
+        &alice,
+        &["remove-password"],
+        Some("новый длинный пароль"),
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = with_passwords(&alice, &["whoami"], None, None);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("@alice"));
+    assert!(stderr(&out).contains("не зашифрована"), "{}", stderr(&out));
+
+    // И зашифровать снова.
+    let out = with_passwords(&alice, &["set-password"], None, Some(TEST_PASSWORD));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(alice.ok(&["whoami"]).contains("@alice"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unencrypted_profile_and_busy_database() {
+    let dir = tmp_dir("plain");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    let out = with_passwords(&bob, &["init", "--no-password"], None, None);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("не зашифрована"));
+    assert!(
+        with_passwords(&bob, &["whoami"], None, None)
+            .status
+            .success()
+    );
+
+    // Пока работает `listen`, базу перешифровывать нельзя.
+    let mut listen = bob.cmd(&["listen"]);
+    listen.env_remove("MESSENGER_PASSWORD");
+    let mut listen = listen
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(listen.stdout.as_mut().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    assert!(first.starts_with("В сети"), "{first}");
+
+    let out = with_passwords(&bob, &["set-password"], None, Some(TEST_PASSWORD));
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("другим процессом"),
+        "{}",
+        stderr(&out)
+    );
+
+    listen.kill().unwrap();
+    let _ = listen.wait();
+    let out = with_passwords(&bob, &["set-password"], None, Some(TEST_PASSWORD));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(bob.ok(&["whoami"]).contains("account_id"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -21,6 +21,8 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 rustls.workspace = true
+rpassword.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 relay_server.workspace = true
