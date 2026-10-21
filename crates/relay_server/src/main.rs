@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use relay_server::{Config, Relay};
+use relay_server::ratelimit::Rate;
+use relay_server::{Config, Limits, Relay};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
@@ -28,6 +29,23 @@ struct Args {
     /// Максимум сообщений в очереди одного получателя.
     #[arg(long, default_value_t = 1000)]
     max_queue: usize,
+
+    /// Релей стоит за своим обратным прокси: брать адрес клиента из X-Forwarded-For.
+    /// Без прокси НЕ включайте — клиент сможет подставить любой адрес.
+    #[arg(long, env = "RELAY_TRUST_FORWARDED_FOR")]
+    trust_forwarded_for: bool,
+
+    /// Новых подключений в минуту с одного IP.
+    #[arg(long, default_value_t = 60)]
+    connections_per_ip_per_minute: u32,
+
+    /// Отправленных сообщений в минуту от одного аккаунта.
+    #[arg(long, default_value_t = 120)]
+    sends_per_minute: u32,
+
+    /// Сколько одноразовых предключей одного аккаунта можно раздать за час.
+    #[arg(long, default_value_t = 50)]
+    one_time_prekeys_per_hour: u32,
 }
 
 #[tokio::main]
@@ -43,6 +61,13 @@ async fn main() -> Result<()> {
         db_path: (!args.in_memory).then_some(args.db.clone()),
         message_ttl: Duration::from_secs(args.ttl_days * 24 * 3600),
         max_queue_per_recipient: args.max_queue,
+        trust_forwarded_for: args.trust_forwarded_for,
+        limits: Limits {
+            connections_per_ip: Rate::per_minute(args.connections_per_ip_per_minute),
+            sends: Rate::per_minute(args.sends_per_minute),
+            one_time_per_target: Rate::per_hour(args.one_time_prekeys_per_hour),
+            ..Limits::default()
+        },
         ..Config::default()
     };
 

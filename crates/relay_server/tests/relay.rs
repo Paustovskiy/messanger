@@ -3,6 +3,7 @@
 use crypto_core::{Bundle, Identity, PeerKeys, PrekeySecrets, SessionSet};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientMessage, EnvelopeB64, ServerMessage, SignedPrekey, b64, decode_fixed};
+use relay_server::ratelimit::Rate;
 use relay_server::{Config, Relay};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -745,6 +746,228 @@ async fn foreign_or_oversized_prekey_uploads_are_rejected() {
             has_signed_prekey: true,
             one_time_left: 3
         }
+    );
+    server.stop().await;
+}
+
+fn limited(f: impl FnOnce(&mut relay_server::Limits)) -> Config {
+    let mut c = Config::default();
+    f(&mut c.limits);
+    c
+}
+
+async fn fetch(c: &mut Client, target: &str) -> Option<u32> {
+    c.send(ClientMessage::FetchBundle {
+        account_id: target.into(),
+    })
+    .await;
+    match c.recv().await {
+        ServerMessage::Bundle {
+            signed_prekey: Some(_),
+            one_time,
+            ..
+        } => one_time.map(|k| k.id),
+        other => panic!("expected bundle, got {other:?}"),
+    }
+}
+
+/// Злоумышленник заводит много аккаунтов и с каждого запрашивает предключи
+/// жертвы. Лимит на получателя не даёт раздать больше одноразовых ключей,
+/// а подписанный предключ выдаётся всегда — переписка не ломается.
+#[tokio::test]
+async fn one_time_prekeys_cannot_be_drained_with_many_accounts() {
+    let server = Server::start(limited(|l| l.one_time_per_target = Rate::per_hour(2))).await;
+    let bob = Identity::generate("bob");
+    let mut b = Client::connect(&server.url(), &bob).await;
+    b.send(publish(&bob, 1, 1..6)).await;
+    assert!(matches!(
+        b.recv_any().await,
+        ServerMessage::PrekeyStatus { .. }
+    ));
+    assert!(matches!(
+        b.recv_any().await,
+        ServerMessage::PrekeyStatus {
+            one_time_left: 5,
+            ..
+        }
+    ));
+
+    let mut got = vec![];
+    for i in 0..4 {
+        let attacker = Identity::generate(format!("sybil{i}"));
+        let mut a = Client::connect(&server.url(), &attacker).await;
+        got.push(fetch(&mut a, "bob").await);
+    }
+    assert_eq!(got, [Some(1), Some(2), None, None]);
+    server.stop().await;
+}
+
+/// Один и тот же аккаунт часто запрашивает предключи — сверх лимита без OPK,
+/// и это не тратит бюджет получателя.
+#[tokio::test]
+async fn frequent_bundle_requests_get_no_one_time_prekeys() {
+    let server = Server::start(limited(|l| l.bundle_fetches = Rate::per_hour(1))).await;
+    let bob = Identity::generate("bob");
+    let mut b = Client::connect(&server.url(), &bob).await;
+    b.send(publish(&bob, 1, 1..4)).await;
+
+    let mut a = Client::connect(&server.url(), &Identity::generate("alice")).await;
+    assert_eq!(fetch(&mut a, "bob").await, Some(1));
+    assert_eq!(fetch(&mut a, "bob").await, None);
+    assert_eq!(fetch(&mut a, "bob").await, None);
+
+    // Другой честный собеседник по-прежнему получает одноразовый ключ.
+    let mut c = Client::connect(&server.url(), &Identity::generate("carol")).await;
+    assert_eq!(fetch(&mut c, "bob").await, Some(2));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn message_flood_is_rate_limited() {
+    let server = Server::start(limited(|l| l.sends = Rate::per_hour(3))).await;
+    let (alice, bob) = (Identity::generate("alice"), Identity::generate("bob"));
+    let mut a = Client::connect(&server.url(), &alice).await;
+    for i in 0..3 {
+        accepted(
+            &a.send_text(&bob, &format!("m{i}"), "x").await,
+            &format!("m{i}"),
+        );
+    }
+    assert!(matches!(
+        a.send_text(&bob, "m3", "x").await,
+        ServerMessage::Error { message, msg_id: Some(id) } if message.contains("rate limited") && id == "m3"
+    ));
+    // Лимит — на отправителя: другие пишут Бобу спокойно.
+    let mut c = Client::connect(&server.url(), &Identity::generate("carol")).await;
+    accepted(&c.send_text(&bob, "c1", "x").await, "c1");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn frame_flood_is_rate_limited() {
+    let server = Server::start(limited(|l| l.frames_per_connection = Rate::per_hour(3))).await;
+    let mut a = Client::connect(&server.url(), &Identity::generate("alice")).await;
+    for _ in 0..3 {
+        a.ack(&Identity::generate("x"), "nothing").await; // молча игнорируются
+    }
+    a.ack(&Identity::generate("x"), "nothing").await;
+    assert!(matches!(
+        a.recv().await,
+        ServerMessage::Error { message, .. } if message.contains("rate limited")
+    ));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn too_many_connections_from_one_ip_get_http_429() {
+    let server = Server::start(limited(|l| l.connections_per_ip = Rate::per_hour(3))).await;
+    let mut open = vec![];
+    for _ in 0..3 {
+        open.push(Client::raw(&server.url()).await);
+    }
+    let err = tokio_tungstenite::connect_async(server.url())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("429"), "{err}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn simultaneous_connections_per_account_are_capped() {
+    let server = Server::start(limited(|l| l.max_connections_per_account = 2)).await;
+    let bob = Identity::generate("bob");
+    let _c1 = Client::connect(&server.url(), &bob).await;
+    let _c2 = Client::connect(&server.url(), &bob).await;
+
+    let mut c3 = Client::unauthenticated(&server.url(), &bob).await;
+    let nonce = c3.challenge().await;
+    c3.auth_with(&nonce, &bob).await;
+    assert!(matches!(
+        c3.recv().await,
+        ServerMessage::Error { message, .. } if message.contains("too many")
+    ));
+
+    // Когда одно закрылось — место освободилось.
+    drop(_c1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Client::connect(&server.url(), &bob).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn prekey_publish_spam_is_rate_limited() {
+    let server = Server::start(limited(|l| l.publishes = Rate::per_hour(2))).await;
+    let bob = Identity::generate("bob");
+    let mut b = Client::connect(&server.url(), &bob).await;
+    for _ in 0..2 {
+        b.send(publish(&bob, 1, 0..0)).await;
+    }
+    b.send(publish(&bob, 1, 0..0)).await;
+    assert!(matches!(
+        b.recv().await,
+        ServerMessage::Error { message, .. } if message.contains("rate limited")
+    ));
+    server.stop().await;
+}
+
+async fn connect_as_ip(url: &str, ip: &str) -> Result<(), String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("x-forwarded-for", ip.parse().unwrap());
+    tokio_tungstenite::connect_async(req)
+        .await
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn forwarded_for_is_ignored_unless_trusted() {
+    // Без доверия к прокси заголовок не помогает обойти лимит по IP.
+    let server = Server::start(limited(|l| l.connections_per_ip = Rate::per_hour(2))).await;
+    for ip in ["1.1.1.1", "2.2.2.2"] {
+        connect_as_ip(&server.url(), ip).await.unwrap();
+    }
+    assert!(
+        connect_as_ip(&server.url(), "3.3.3.3")
+            .await
+            .unwrap_err()
+            .contains("429")
+    );
+    server.stop().await;
+
+    // За своим прокси каждый клиент считается по своему адресу (берётся последний).
+    let mut config = limited(|l| l.connections_per_ip = Rate::per_hour(2));
+    config.trust_forwarded_for = true;
+    let server = Server::start(config).await;
+    for ip in ["1.1.1.1", "2.2.2.2", "3.3.3.3", "9.9.9.9, 4.4.4.4"] {
+        connect_as_ip(&server.url(), ip).await.unwrap();
+    }
+    connect_as_ip(&server.url(), "1.1.1.1").await.unwrap();
+    assert!(
+        connect_as_ip(&server.url(), "1.1.1.1")
+            .await
+            .unwrap_err()
+            .contains("429")
+    );
+    // Подделанное начало цепочки не помогает: считается последний адрес.
+    assert!(
+        connect_as_ip(&server.url(), "5.5.5.5, 1.1.1.1")
+            .await
+            .unwrap_err()
+            .contains("429")
+    );
+    // Битое последнее значение: берём TCP-адрес (127.0.0.1), а не подделанное раньше в цепочке.
+    for _ in 0..2 {
+        connect_as_ip(&server.url(), "6.6.6.6, garbage")
+            .await
+            .unwrap();
+    }
+    assert!(
+        connect_as_ip(&server.url(), "7.7.7.7, garbage")
+            .await
+            .unwrap_err()
+            .contains("429")
     );
     server.stop().await;
 }

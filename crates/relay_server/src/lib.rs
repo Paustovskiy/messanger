@@ -13,16 +13,18 @@
 //!    не подтвердит (`ack`), что сохранил его у себя. Доставка «хотя бы один
 //!    раз»; дубли клиент отбрасывает по `msg_id`.
 
+pub mod ratelimit;
 pub mod store;
 
 use anyhow::Result;
 use axum::{
     Router,
     extract::{
-        State,
+        ConnectInfo, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use dashmap::DashMap;
@@ -31,7 +33,9 @@ use protocol::{
     ClientMessage, Envelope, OneTimePrekey, OneTimePrekeyB64, ServerMessage, SignedPrekey,
     SignedPrekeyB64, b64, check_id, decode_fixed,
 };
+use ratelimit::{Rate, RateLimiter};
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +63,79 @@ pub struct Config {
     /// Как часто пинговать клиента. Если от клиента ничего не слышно три
     /// интервала подряд, соединение считается мёртвым и закрывается.
     pub ping_interval: Duration,
+    /// Ограничения частоты.
+    pub limits: Limits,
+    /// Брать адрес клиента из `X-Forwarded-For` (последнее значение).
+    /// Включать, только если релей стоит за своим обратным прокси: иначе
+    /// клиент сможет подставить любой адрес.
+    pub trust_forwarded_for: bool,
+}
+
+/// Ограничения частоты. Всё, что сверх, получает ошибку `rate limited`;
+/// исключение — выдача предключей, которая просто обходится без одноразового ключа.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    /// Новых подключений с одного IP.
+    pub connections_per_ip: Rate,
+    /// Одновременных соединений одного аккаунта.
+    pub max_connections_per_account: usize,
+    /// Любых сообщений от одного соединения (защита от флуда).
+    pub frames_per_connection: Rate,
+    /// Отправленных конвертов от одного аккаунта.
+    pub sends: Rate,
+    /// Публикаций предключей от одного аккаунта.
+    pub publishes: Rate,
+    /// Запросов предключей от одного аккаунта; сверх — без одноразового ключа.
+    pub bundle_fetches: Rate,
+    /// Сколько одноразовых ключей одного аккаунта можно раздать. Защищает от
+    /// «выкачивания» с помощью множества аккаунтов.
+    pub one_time_per_target: Rate,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            connections_per_ip: Rate::per_minute(60),
+            max_connections_per_account: 10,
+            frames_per_connection: Rate::per_minute(600),
+            sends: Rate::per_minute(120),
+            publishes: Rate::per_hour(30),
+            bundle_fetches: Rate::per_minute(30),
+            one_time_per_target: Rate::per_hour(50),
+        }
+    }
+}
+
+struct Limiters {
+    connections_per_ip: RateLimiter,
+    sends: RateLimiter,
+    publishes: RateLimiter,
+    bundle_fetches: RateLimiter,
+    one_time_per_target: RateLimiter,
+}
+
+impl Limiters {
+    fn new(l: &Limits) -> Self {
+        Self {
+            connections_per_ip: RateLimiter::new(l.connections_per_ip),
+            sends: RateLimiter::new(l.sends),
+            publishes: RateLimiter::new(l.publishes),
+            bundle_fetches: RateLimiter::new(l.bundle_fetches),
+            one_time_per_target: RateLimiter::new(l.one_time_per_target),
+        }
+    }
+
+    fn cleanup(&self) {
+        for l in [
+            &self.connections_per_ip,
+            &self.sends,
+            &self.publishes,
+            &self.bundle_fetches,
+            &self.one_time_per_target,
+        ] {
+            l.cleanup();
+        }
+    }
 }
 
 impl Default for Config {
@@ -71,6 +148,8 @@ impl Default for Config {
             max_one_time_prekeys: 200,
             max_frame_bytes: 128 * 1024,
             ping_interval: Duration::from_secs(30),
+            limits: Limits::default(),
+            trust_forwarded_for: false,
         }
     }
 }
@@ -88,6 +167,7 @@ struct Inner {
     /// (например, `listen` и `send` в соседних терминалах) — шлём всем.
     online: DashMap<String, Vec<Client>>,
     next_conn_id: AtomicU64,
+    limiters: Limiters,
 }
 
 #[derive(Clone)]
@@ -96,11 +176,13 @@ pub struct Relay(Arc<Inner>);
 impl Relay {
     pub fn new(config: Config) -> Result<Self> {
         let store = Store::open(config.db_path.as_deref())?;
+        let limiters = Limiters::new(&config.limits);
         Ok(Self(Arc::new(Inner {
             config,
             store,
             online: DashMap::new(),
             next_conn_id: AtomicU64::new(1),
+            limiters,
         })))
     }
 
@@ -118,10 +200,16 @@ impl Relay {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let purger = tokio::spawn(purge_loop(self.clone()));
-        let result = axum::serve(listener, self.router())
-            .with_graceful_shutdown(shutdown)
-            .await;
+        let cleaner = tokio::spawn(limiter_cleanup_loop(self.clone()));
+        let result = axum::serve(
+            listener,
+            self.router()
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await;
         purger.abort();
+        cleaner.abort();
         Ok(result?)
     }
 
@@ -152,12 +240,56 @@ async fn purge_loop(relay: Relay) {
     }
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(relay): State<Relay>) -> impl IntoResponse {
+async fn limiter_cleanup_loop(relay: Relay) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        relay.0.limiters.cleanup();
+    }
+}
+
+/// Адрес клиента: из `X-Forwarded-For`, если мы за своим прокси, иначе из TCP.
+fn client_ip(relay: &Relay, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    if relay.0.config.trust_forwarded_for {
+        // Берём строго последнее значение: его добавил наш прокси, а более ранние
+        // клиент мог подделать. Если оно битое — не ищем «подходящее» раньше в цепочке.
+        let last = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .next_back()
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|ip| ip.trim().parse::<IpAddr>().ok());
+        if let Some(ip) = last {
+            return ip;
+        }
+    }
+    peer.ip()
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(relay): State<Relay>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let ip = client_ip(&relay, peer, &headers);
+    if !relay.0.limiters.connections_per_ip.check(&ip.to_string()) {
+        warn!(%ip, "too many connections from this address");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many connections, retry later",
+        )
+            .into_response();
+    }
     let max = relay.0.config.max_frame_bytes;
     ws.max_message_size(max)
         .max_frame_size(max)
         .on_upgrade(move |socket| handle_socket(relay, socket))
+        .into_response()
 }
+
+const RATE_LIMITED: &str = "rate limited, retry later";
 
 fn to_json(msg: &ServerMessage) -> String {
     serde_json::to_string(msg).expect("ServerMessage is always serializable")
@@ -253,10 +385,24 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
         return;
     };
 
-    relay.0.online.entry(me.clone()).or_default().push(Client {
-        conn_id,
-        tx: tx.clone(),
-    });
+    {
+        let mut clients = relay.0.online.entry(me.clone()).or_default();
+        if clients.len() >= relay.0.config.limits.max_connections_per_account {
+            drop(clients);
+            warn!(account_id = %me, "too many simultaneous connections");
+            let _ = tx.send(error(
+                "too many simultaneous connections for this account",
+                None,
+            ));
+            drop(tx);
+            let _ = writer.await;
+            return;
+        }
+        clients.push(Client {
+            conn_id,
+            tx: tx.clone(),
+        });
+    }
     let _ = tx.send(to_json(&ServerMessage::Authenticated {
         account_id: me.clone(),
     }));
@@ -268,7 +414,12 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
     let _ = tx.send(prekey_status(&relay, &me));
 
     // --- 2. основной цикл ------------------------------------------------
+    let frames = RateLimiter::new(relay.0.config.limits.frames_per_connection);
     while let Some(msg) = next_msg().await {
+        if matches!(msg, Message::Text(_) | Message::Binary(_)) && !frames.check("") {
+            let _ = tx.send(error(RATE_LIMITED, None));
+            continue;
+        }
         match msg {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
                 Ok(ClientMessage::Send {
@@ -276,7 +427,11 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
                     msg_id,
                     envelope,
                 }) => {
-                    let reply = handle_send(&relay, &me, &my_sign_pub, &to, &msg_id, envelope);
+                    let reply = if relay.0.limiters.sends.check(&me) {
+                        handle_send(&relay, &me, &my_sign_pub, &to, &msg_id, envelope)
+                    } else {
+                        error(RATE_LIMITED, Some(msg_id))
+                    };
                     let _ = tx.send(reply);
                 }
                 Ok(ClientMessage::Ack { to, msg_id }) => handle_ack(&relay, &me, &to, &msg_id),
@@ -284,12 +439,15 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
                     signed_prekey,
                     one_time,
                 }) => {
-                    let reply =
-                        handle_publish(&relay, &me, &my_sign_pub, &signed_prekey, &one_time);
+                    let reply = if relay.0.limiters.publishes.check(&me) {
+                        handle_publish(&relay, &me, &my_sign_pub, &signed_prekey, &one_time)
+                    } else {
+                        error(RATE_LIMITED, None)
+                    };
                     let _ = tx.send(reply);
                 }
                 Ok(ClientMessage::FetchBundle { account_id }) => {
-                    let _ = tx.send(handle_fetch_bundle(&relay, &account_id));
+                    let _ = tx.send(handle_fetch_bundle(&relay, &me, &account_id));
                 }
                 Ok(ClientMessage::Auth { .. }) => {
                     let _ = tx.send(error("already authenticated", None));
@@ -506,11 +664,25 @@ fn handle_publish(
     }
 }
 
-fn handle_fetch_bundle(relay: &Relay, account_id: &str) -> String {
+fn handle_fetch_bundle(relay: &Relay, me: &str, account_id: &str) -> String {
     if let Err(e) = check_id(account_id, "account_id") {
         return error(e.to_string(), None);
     }
-    match relay.0.store.take_bundle(account_id) {
+    // Сверх лимитов набор выдаётся без одноразового ключа: переписка работает,
+    // а «выкачать» чужие одноразовые ключи не получится.
+    let requester_ok = relay.0.limiters.bundle_fetches.check(me);
+    let allow_one_time = || {
+        let ok = requester_ok && relay.0.limiters.one_time_per_target.check(account_id);
+        if !ok {
+            debug!(
+                requester = me,
+                target = account_id,
+                "one-time prekey withheld by rate limit"
+            );
+        }
+        ok
+    };
+    match relay.0.store.take_bundle(account_id, allow_one_time) {
         Ok(bundle) => {
             let (signed_prekey, one_time) = match bundle {
                 Some((s, o)) => (
