@@ -76,6 +76,7 @@ fn prekey_of(id: &Identity) -> ([u8; 32], SignedPrekey) {
 fn keys_of(id: &Identity) -> PeerKeys {
     PeerKeys {
         account_id: id.account_id().into(),
+        device_id: id.device_id(),
         x25519_pub: id.x_public_bytes(),
         ed25519_pub: id.sign_public_bytes(),
     }
@@ -103,7 +104,13 @@ impl Client {
         let nonce = c.challenge().await;
         c.auth_with(&nonce, id).await;
         match c.recv().await {
-            ServerMessage::Authenticated { account_id } => assert_eq!(account_id, id.account_id()),
+            ServerMessage::Authenticated {
+                account_id,
+                device_id,
+            } => assert_eq!(
+                (account_id.as_str(), device_id),
+                (id.account_id(), id.device_id())
+            ),
             other => panic!("expected Authenticated, got {other:?}"),
         }
         c
@@ -128,9 +135,15 @@ impl Client {
 
     async fn auth_with(&mut self, nonce: &[u8; 32], signer: &Identity) {
         let account_id = self.id.account_id().to_string();
-        let sig = signer.sign(&protocol::relay_auth_signing_bytes(nonce, &account_id));
+        let device_id = self.id.device_id();
+        let sig = signer.sign(&protocol::relay_auth_signing_bytes(
+            nonce,
+            &account_id,
+            device_id,
+        ));
         self.send(ClientMessage::Auth {
             account_id,
+            device_id,
             sign_pub_b64: b64(signer.sign_public_bytes()),
             sig_b64: b64(sig),
         })
@@ -180,7 +193,7 @@ impl Client {
     }
 
     fn envelope(&mut self, to: &Identity, text: &str) -> EnvelopeB64 {
-        let set = self.sessions.entry(to.account_id().into()).or_default();
+        let set = self.sessions.entry(dev(to)).or_default();
         if set.is_empty() {
             let bundle = Bundle {
                 signed_prekey: prekey_of(to).1,
@@ -195,6 +208,7 @@ impl Client {
         let envelope = self.envelope(to, text);
         self.send(ClientMessage::Send {
             to: to.account_id().into(),
+            to_device: to.device_id(),
             msg_id: msg_id.into(),
             envelope,
         })
@@ -207,16 +221,20 @@ impl Client {
         match self.recv().await {
             ServerMessage::Deliver {
                 from: f,
+                from_device,
                 msg_id,
                 envelope,
             } => {
-                assert_eq!(f, from.account_id());
+                assert_eq!(
+                    (f.as_str(), from_device),
+                    (from.account_id(), from.device_id())
+                );
                 let env = protocol::Envelope::try_from(envelope).unwrap();
                 let secrets = PrekeySecrets {
                     signed_prekey: Some(prekey_of(&self.id).0),
                     ..Default::default()
                 };
-                let set = self.sessions.entry(from.account_id().into()).or_default();
+                let set = self.sessions.entry(dev(from)).or_default();
                 let opened = self.id.open(&keys_of(from), set, &env, &secrets).unwrap();
                 (msg_id, String::from_utf8(opened.plaintext).unwrap())
             }
@@ -227,10 +245,16 @@ impl Client {
     async fn ack(&mut self, to: &Identity, msg_id: &str) {
         self.send(ClientMessage::Ack {
             to: to.account_id().into(),
+            to_device: to.device_id(),
             msg_id: msg_id.into(),
         })
         .await;
     }
+}
+
+/// Ключ сессии: «аккаунт/устройство».
+fn dev(id: &Identity) -> String {
+    format!("{}/{}", id.account_id(), id.device_id())
 }
 
 fn accepted(m: &ServerMessage, id: &str) {
@@ -262,6 +286,7 @@ async fn online_delivery_with_ack() {
         a.recv().await,
         ServerMessage::DeliverAck {
             from: "bob".into(),
+            from_device: 1,
             msg_id: "m1".into()
         }
     );
@@ -301,6 +326,7 @@ async fn offline_queue_is_kept_until_ack() {
         a.recv().await,
         ServerMessage::DeliverAck {
             from: "bob".into(),
+            from_device: 1,
             msg_id: "m1".into()
         }
     );
@@ -330,6 +356,7 @@ async fn delivery_ack_waits_for_offline_sender() {
         a.recv().await,
         ServerMessage::DeliverAck {
             from: "bob".into(),
+            from_device: 1,
             msg_id: "m1".into()
         }
     );
@@ -398,6 +425,7 @@ async fn nothing_works_before_auth() {
     let envelope = c.envelope(&bob, "x");
     c.send(ClientMessage::Send {
         to: "bob".into(),
+        to_device: 1,
         msg_id: "m".into(),
         envelope,
     })
@@ -439,6 +467,7 @@ async fn forged_or_mismatched_envelopes_are_rejected() {
     let forged = make_envelope(&impostor, &bob, "x");
     a.send(ClientMessage::Send {
         to: "bob".into(),
+        to_device: 1,
         msg_id: "f1".into(),
         envelope: forged,
     })
@@ -449,6 +478,7 @@ async fn forged_or_mismatched_envelopes_are_rejected() {
     let for_carol = a.envelope(&carol, "x");
     a.send(ClientMessage::Send {
         to: "bob".into(),
+        to_device: 1,
         msg_id: "f2".into(),
         envelope: for_carol,
     })
@@ -561,6 +591,7 @@ async fn several_connections_of_one_account_all_receive() {
             a.recv().await,
             ServerMessage::DeliverAck {
                 from: "bob".into(),
+                from_device: 1,
                 msg_id: "m1".into()
             }
         );
@@ -641,12 +672,14 @@ async fn prekeys_are_published_and_handed_out_once() {
     // Пока Боб ничего не публиковал — пустой набор.
     a.send(ClientMessage::FetchBundle {
         account_id: "bob".into(),
+        device_id: 1,
     })
     .await;
     assert_eq!(
         a.recv().await,
         ServerMessage::Bundle {
             account_id: "bob".into(),
+            device_id: 1,
             signed_prekey: None,
             one_time: None
         }
@@ -657,7 +690,8 @@ async fn prekeys_are_published_and_handed_out_once() {
         b.recv_any().await,
         ServerMessage::PrekeyStatus {
             has_signed_prekey: false,
-            one_time_left: 0
+            one_time_left: 0,
+            device_list_version: None
         }
     );
     b.send(publish(&bob, 1, 1..3)).await;
@@ -665,7 +699,8 @@ async fn prekeys_are_published_and_handed_out_once() {
         b.recv_any().await,
         ServerMessage::PrekeyStatus {
             has_signed_prekey: true,
-            one_time_left: 2
+            one_time_left: 2,
+            device_list_version: None
         }
     );
 
@@ -673,6 +708,7 @@ async fn prekeys_are_published_and_handed_out_once() {
     for _ in 0..3 {
         a.send(ClientMessage::FetchBundle {
             account_id: "bob".into(),
+            device_id: 1,
         })
         .await;
         match a.recv().await {
@@ -704,7 +740,8 @@ async fn prekeys_are_published_and_handed_out_once() {
         b.recv_any().await,
         ServerMessage::PrekeyStatus {
             has_signed_prekey: true,
-            one_time_left: 0
+            one_time_left: 0,
+            device_list_version: None
         }
     );
     server.stop().await;
@@ -744,7 +781,8 @@ async fn foreign_or_oversized_prekey_uploads_are_rejected() {
         b.recv_any().await,
         ServerMessage::PrekeyStatus {
             has_signed_prekey: true,
-            one_time_left: 3
+            one_time_left: 3,
+            device_list_version: None
         }
     );
     server.stop().await;
@@ -759,6 +797,7 @@ fn limited(f: impl FnOnce(&mut relay_server::Limits)) -> Config {
 async fn fetch(c: &mut Client, target: &str) -> Option<u32> {
     c.send(ClientMessage::FetchBundle {
         account_id: target.into(),
+        device_id: 1,
     })
     .await;
     match c.recv().await {
@@ -969,5 +1008,270 @@ async fn forwarded_for_is_ignored_unless_trusted() {
             .unwrap_err()
             .contains("429")
     );
+    server.stop().await;
+}
+
+// ---------- Несколько устройств ----------
+
+/// Подписанный список устройств аккаунта `primary` (версия `version`).
+fn device_list(
+    primary: &Identity,
+    others: &[&Identity],
+    version: u64,
+) -> protocol::SignedDeviceListB64 {
+    let mut devices = vec![primary.device_info("ноутбук")];
+    devices.extend(others.iter().map(|d| d.device_info("телефон")));
+    primary
+        .sign_device_list(&protocol::DeviceList {
+            account_id: primary.account_id().into(),
+            account_pub: primary.sign_public_bytes(),
+            version,
+            devices,
+        })
+        .unwrap()
+}
+
+fn second_device(primary: &Identity, device_id: u32) -> Identity {
+    Identity::generate(primary.account_id()).with_device(device_id)
+}
+
+async fn publish_list(c: &mut Client, list: protocol::SignedDeviceListB64) -> ServerMessage {
+    c.send(ClientMessage::PublishDeviceList { list }).await;
+    c.recv().await
+}
+
+async fn auth_error(url: &str, id: &Identity) -> String {
+    let mut c = Client::unauthenticated(url, id).await;
+    let nonce = c.challenge().await;
+    c.auth_with(&nonce, id).await;
+    match c.recv().await {
+        ServerMessage::Error { message, .. } => message,
+        other => panic!("expected auth error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn secondary_device_needs_a_signed_device_list() {
+    let server = Server::start(Config::default()).await;
+    let bob = Identity::generate_new();
+    let phone = second_device(&bob, 2);
+
+    // Пока основное устройство не внесло телефон в список — не пускаем.
+    assert!(
+        auth_error(&server.url(), &phone)
+            .await
+            .contains("not in the account's device list")
+    );
+
+    let mut laptop = Client::connect(&server.url(), &bob).await;
+    let list = device_list(&bob, &[&phone], 2);
+    assert_eq!(
+        publish_list(&mut laptop, list.clone()).await,
+        ServerMessage::DeviceList {
+            account_id: bob.account_id().into(),
+            list: Some(list.clone())
+        }
+    );
+    // Тот же список ещё раз — не ошибка.
+    assert!(matches!(
+        publish_list(&mut laptop, list.clone()).await,
+        ServerMessage::DeviceList { .. }
+    ));
+
+    let mut p = Client::connect(&server.url(), &phone).await;
+    // Релей сообщает версию списка — так основное устройство видит, что он актуален.
+    assert!(matches!(
+        p.recv_any().await,
+        ServerMessage::PrekeyStatus {
+            device_list_version: Some(2),
+            ..
+        }
+    ));
+
+    // Чужой ключ под номером телефона не войдёт.
+    let fake_phone = second_device(&bob, 2);
+    assert!(
+        auth_error(&server.url(), &fake_phone)
+            .await
+            .contains("not in the account's device list")
+    );
+
+    // Список доступен всем.
+    let mut a = Client::connect(&server.url(), &Identity::generate("alice")).await;
+    a.send(ClientMessage::FetchDeviceList {
+        account_id: bob.account_id().into(),
+    })
+    .await;
+    assert_eq!(
+        a.recv().await,
+        ServerMessage::DeviceList {
+            account_id: bob.account_id().into(),
+            list: Some(list)
+        }
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn each_device_has_its_own_queue_and_acks() {
+    let server = Server::start(Config::default()).await;
+    let alice = Identity::generate("alice");
+    let bob = Identity::generate_new();
+    let phone = second_device(&bob, 2);
+    let mut laptop = Client::connect(&server.url(), &bob).await;
+    publish_list(&mut laptop, device_list(&bob, &[&phone], 2)).await;
+
+    let mut a = Client::connect(&server.url(), &alice).await;
+    accepted(
+        &a.send_text(&bob, "to-laptop", "ноутбуку").await,
+        "to-laptop",
+    );
+    accepted(
+        &a.send_text(&phone, "to-phone", "телефону").await,
+        "to-phone",
+    );
+
+    // Каждому устройству — только его конверт.
+    assert_eq!(laptop.recv_text(&alice).await.1, "ноутбуку");
+    laptop.expect_silence().await;
+    let mut p = Client::connect(&server.url(), &phone).await;
+    assert_eq!(p.recv_text(&alice).await.1, "телефону");
+    p.expect_silence().await;
+
+    // Подтверждение приходит от конкретного устройства.
+    p.ack(&alice, "to-phone").await;
+    assert_eq!(
+        a.recv().await,
+        ServerMessage::DeliverAck {
+            from: bob.account_id().into(),
+            from_device: 2,
+            msg_id: "to-phone".into()
+        }
+    );
+    // Ноутбук не может подтвердить чужой конверт.
+    laptop.ack(&alice, "to-phone").await;
+    a.expect_silence().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn devices_of_one_account_can_message_each_other() {
+    let server = Server::start(Config::default()).await;
+    let bob = Identity::generate_new();
+    let phone = second_device(&bob, 2);
+    let mut laptop = Client::connect(&server.url(), &bob).await;
+    publish_list(&mut laptop, device_list(&bob, &[&phone], 2)).await;
+    let mut p = Client::connect(&server.url(), &phone).await;
+
+    accepted(&laptop.send_text(&phone, "copy", "копия").await, "copy");
+    assert_eq!(p.recv_text(&bob).await.1, "копия");
+    accepted(&p.send_text(&bob, "back", "назад").await, "back");
+    assert_eq!(laptop.recv_text(&phone).await.1, "назад");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn bad_device_lists_and_unknown_devices_are_rejected() {
+    let server = Server::start(Config::default()).await;
+    let bob = Identity::generate_new();
+    let phone = second_device(&bob, 2);
+    let mallory = Identity::generate_new();
+    let mut laptop = Client::connect(&server.url(), &bob).await;
+
+    // Чужой список.
+    assert!(matches!(
+        publish_list(&mut laptop, device_list(&mallory, &[], 1)).await,
+        ServerMessage::Error { message, .. } if message.contains("bad device list")
+    ));
+
+    publish_list(&mut laptop, device_list(&bob, &[&phone], 3)).await;
+    // Откат на старую версию.
+    assert!(matches!(
+        publish_list(&mut laptop, device_list(&bob, &[], 2)).await,
+        ServerMessage::Error { message, .. } if message.contains("stale")
+    ));
+    // Та же версия, но другое содержимое.
+    assert!(matches!(
+        publish_list(&mut laptop, device_list(&bob, &[], 3)).await,
+        ServerMessage::Error { message, .. } if message.contains("stale")
+    ));
+
+    // Менять список может только основное устройство.
+    let mut p = Client::connect(&server.url(), &phone).await;
+    assert!(matches!(
+        publish_list(&mut p, device_list(&bob, &[&phone], 4)).await,
+        ServerMessage::Error { message, .. } if message.contains("only the primary")
+    ));
+
+    // Отправка на устройство, которого нет в списке.
+    let mut a = Client::connect(&server.url(), &Identity::generate("alice")).await;
+    let ghost = second_device(&bob, 7);
+    assert!(matches!(
+        a.send_text(&ghost, "g", "x").await,
+        ServerMessage::Error { message, msg_id: Some(id) } if message.contains("no such device") && id == "g"
+    ));
+
+    // Телефон не может выдать свой конверт за конверт ноутбука.
+    let mut env = p.envelope(&bob, "подделка");
+    env.from_device = 1;
+    p.send(ClientMessage::Send {
+        to: bob.account_id().into(),
+        to_device: 1,
+        msg_id: "spoof".into(),
+        envelope: env,
+    })
+    .await;
+    assert!(matches!(
+        p.recv().await,
+        ServerMessage::Error { msg_id: Some(id), .. } if id == "spoof"
+    ));
+    laptop.expect_silence().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn removed_device_is_disconnected_and_forgotten() {
+    let server = Server::start(Config::default()).await;
+    let alice = Identity::generate("alice");
+    let bob = Identity::generate_new();
+    let phone = second_device(&bob, 2);
+    let tablet = second_device(&bob, 3);
+    let mut laptop = Client::connect(&server.url(), &bob).await;
+    publish_list(&mut laptop, device_list(&bob, &[&phone, &tablet], 2)).await;
+
+    let mut p = Client::connect(&server.url(), &phone).await;
+    let mut t = Client::connect(&server.url(), &tablet).await;
+    // Пока телефон в сети, для него копится очередь от Алисы.
+    let mut a = Client::connect(&server.url(), &alice).await;
+    accepted(&a.send_text(&phone, "m1", "для телефона").await, "m1");
+    p.recv_text(&alice).await;
+
+    // Телефон потерян: отключаем.
+    let list = device_list(&bob, &[&tablet], 3);
+    publish_list(&mut laptop, list.clone()).await;
+
+    // Его соединение закрыто с объяснением…
+    assert!(matches!(
+        p.recv().await,
+        ServerMessage::Error { message, .. } if message.contains("removed")
+    ));
+    // …а планшет узнал о новом списке сразу.
+    assert_eq!(
+        t.recv().await,
+        ServerMessage::DeviceList {
+            account_id: bob.account_id().into(),
+            list: Some(list)
+        }
+    );
+    // Войти снова телефон не может, писать ему — тоже.
+    assert!(
+        auth_error(&server.url(), &phone)
+            .await
+            .contains("not in the account's device list")
+    );
+    assert!(matches!(
+        a.send_text(&phone, "m2", "x").await,
+        ServerMessage::Error { message, .. } if message.contains("no such device")
+    ));
     server.stop().await;
 }

@@ -328,7 +328,7 @@ mod tests {
     }
 
     fn header_aad(h: &RatchetHeader) -> Vec<u8> {
-        protocol::envelope_header_bytes("a", "b", None, h)
+        protocol::envelope_header_bytes("a", 1, "b", 1, None, h)
     }
 
     #[test]

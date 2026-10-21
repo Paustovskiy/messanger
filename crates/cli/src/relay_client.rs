@@ -15,7 +15,7 @@ pub struct RelayConn {
 }
 
 impl RelayConn {
-    /// Подключиться к релею и войти под своей личностью.
+    /// Подключиться к релею и войти как это устройство.
     pub async fn connect(url: &str, me: &Identity) -> Result<Self> {
         let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url))
             .await
@@ -32,9 +32,15 @@ impl RelayConn {
         };
 
         let account_id = me.account_id().to_string();
-        let sig = me.sign(&protocol::relay_auth_signing_bytes(&nonce, &account_id));
+        let device_id = me.device_id();
+        let sig = me.sign(&protocol::relay_auth_signing_bytes(
+            &nonce,
+            &account_id,
+            device_id,
+        ));
         conn.send(&ClientMessage::Auth {
             account_id,
+            device_id,
             sign_pub_b64: b64(me.sign_public_bytes()),
             sig_b64: b64(sig),
         })
