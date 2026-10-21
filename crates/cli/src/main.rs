@@ -541,6 +541,12 @@ fn cmd_send(db: &Db, relay: &str, to: &str, text: &str, offline: bool, wait: u64
         let ids = [msg_id.clone()];
         wait_for(&mut s, ACCEPT_TIMEOUT, |s| all_settled(s, &ids)).await?;
         if let Some(reason) = s.rejected.get(&msg_id) {
+            if reason.contains("rate limited") {
+                bail!(
+                    "релей просит подождать (слишком много сообщений подряд); \
+                     сообщение осталось в исходящих и уйдёт при `messenger sync`"
+                );
+            }
             bail!("релей отклонил сообщение: {reason}");
         }
         if !s.accepted.contains(&msg_id) {

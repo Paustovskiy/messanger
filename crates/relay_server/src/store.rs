@@ -256,9 +256,13 @@ impl Store {
     }
 
     /// Набор предключей для новой сессии. Одноразовый ключ выдаётся один раз.
+    ///
+    /// `allow_one_time` спрашивается, только если одноразовый ключ вообще есть:
+    /// так лимит выдачи тратится лишь на реально выданные ключи.
     pub fn take_bundle(
         &self,
         account_id: &str,
+        allow_one_time: impl FnOnce() -> bool,
     ) -> Result<Option<(SignedPrekey, Option<OneTimePrekey>)>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -295,6 +299,7 @@ impl Store {
             )
             .optional()?;
         let one_time = match one_time {
+            Some(_) if !allow_one_time() => None,
             None => None,
             Some((id, public)) => {
                 tx.execute(
