@@ -1,43 +1,394 @@
-use crypto_core::{CryptoError, Identity, verify_contact_card, verify_envelope};
-use protocol::{Envelope, EnvelopeB64, MAX_PLAINTEXT_LEN};
+//! Сессии целиком: X3DH + Double Ratchet + подписи, как их видит приложение.
 
-fn pair() -> (Identity, Identity) {
-    (Identity::generate("alice"), Identity::generate("bob"))
+use crypto_core::{
+    Bundle, CryptoError, Identity, PeerKeys, PrekeySecrets, SessionSet, new_one_time_prekey,
+    verify_contact_card, verify_envelope,
+};
+use protocol::{Envelope, EnvelopeB64, MAX_PLAINTEXT_LEN, SignedPrekey};
+use std::collections::{HashMap, HashSet};
+
+/// Участник со всем, что клиент хранит в базе.
+struct Party {
+    id: Identity,
+    spk_id: u32,
+    spk_secrets: HashMap<u32, [u8; 32]>,
+    spk_public: SignedPrekey,
+    opks: HashMap<u32, ([u8; 32], protocol::OneTimePrekey)>,
+    used_eks: HashSet<[u8; 32]>,
+    sessions: HashMap<String, SessionSet>,
+}
+
+impl Party {
+    fn new(name: &str) -> Self {
+        let id = Identity::generate(name);
+        let (secret, spk) = id.new_signed_prekey(1);
+        let opks = (100..105).map(|i| (i, new_one_time_prekey(i))).collect();
+        Self {
+            id,
+            spk_id: 1,
+            spk_secrets: HashMap::from([(1, secret)]),
+            spk_public: spk,
+            opks,
+            used_eks: HashSet::new(),
+            sessions: HashMap::new(),
+        }
+    }
+
+    fn keys(&self) -> PeerKeys {
+        PeerKeys {
+            account_id: self.id.account_id().into(),
+            x25519_pub: self.id.x_public_bytes(),
+            ed25519_pub: self.id.sign_public_bytes(),
+        }
+    }
+
+    /// То, что выдал бы релей (одноразовый ключ «уходит» с релея).
+    fn bundle(&mut self, with_opk: bool) -> Bundle {
+        let one_time = if with_opk {
+            let id = *self.opks.keys().min().unwrap();
+            Some(self.opks[&id].1)
+        } else {
+            None
+        };
+        Bundle {
+            signed_prekey: self.spk_public,
+            one_time,
+        }
+    }
+
+    fn rotate_spk(&mut self) {
+        self.spk_id += 1;
+        let (secret, spk) = self.id.new_signed_prekey(self.spk_id);
+        self.spk_secrets.insert(self.spk_id, secret);
+        self.spk_public = spk;
+    }
+
+    fn start(&mut self, peer: &mut Party, with_opk: bool) {
+        let bundle = peer.bundle(with_opk);
+        let set = self
+            .sessions
+            .entry(peer.id.account_id().into())
+            .or_default();
+        self.id.start_session(&peer.keys(), &bundle, set).unwrap();
+    }
+
+    fn send(&mut self, to: &Party, text: &str) -> Envelope {
+        let set = self
+            .sessions
+            .get_mut(to.id.account_id())
+            .expect("no session");
+        let env = self.id.seal(&to.keys(), set, text.as_bytes()).unwrap();
+        // По сети конверт идёт как JSON.
+        let json = serde_json::to_string(&EnvelopeB64::from(&env)).unwrap();
+        Envelope::try_from(serde_json::from_str::<EnvelopeB64>(&json).unwrap()).unwrap()
+    }
+
+    fn recv(&mut self, from: &Party, env: &Envelope) -> Result<String, CryptoError> {
+        let secrets = match env.prekey {
+            None => PrekeySecrets::default(),
+            Some(p) => PrekeySecrets {
+                signed_prekey: self.spk_secrets.get(&p.spk_id).copied(),
+                one_time: p.opk_id.and_then(|id| self.opks.get(&id).map(|k| k.0)),
+                ek_already_used: self.used_eks.contains(&p.ek_pub),
+            },
+        };
+        // Как в приложении: работаем с копией и сохраняем только при успехе.
+        let mut set = self
+            .sessions
+            .get(from.id.account_id())
+            .cloned()
+            .unwrap_or_default();
+        let opened = self.id.open(&from.keys(), &mut set, env, &secrets)?;
+        if let Some(ek) = opened.new_session_ek {
+            self.used_eks.insert(ek);
+        }
+        if let Some(id) = opened.consumed_one_time {
+            self.opks.remove(&id);
+        }
+        // Сохраняем через JSON — ровно как в базе.
+        let set = SessionSet::from_json(&set.to_json()).unwrap();
+        self.sessions.insert(from.id.account_id().into(), set);
+        Ok(String::from_utf8(opened.plaintext).unwrap())
+    }
+}
+
+fn pair() -> (Party, Party) {
+    (Party::new("alice"), Party::new("bob"))
 }
 
 #[test]
-fn alice_bob_roundtrip() {
-    let (alice, bob) = pair();
+fn first_contact_with_and_without_one_time_prekey() {
+    for with_opk in [true, false] {
+        let (mut alice, mut bob) = pair();
+        alice.start(&mut bob, with_opk);
 
-    let env = alice
-        .encrypt_to("bob", &bob.x_public_bytes(), b"hello bob")
-        .unwrap();
-    assert_eq!(
-        bob.decrypt(&env, &alice.sign_public_bytes()).unwrap(),
-        b"hello bob"
-    );
+        let m = alice.send(&bob, "привет, Боб");
+        let pk = m.prekey.expect("first message carries X3DH header");
+        assert_eq!(pk.opk_id.is_some(), with_opk);
+        assert_eq!(bob.recv(&alice, &m).unwrap(), "привет, Боб");
+        assert_eq!(
+            bob.opks.len(),
+            if with_opk { 4 } else { 5 },
+            "used OPK is deleted"
+        );
 
-    let env = bob
-        .encrypt_to("alice", &alice.x_public_bytes(), b"hello alice")
-        .unwrap();
+        let r = bob.send(&alice, "привет, Алиса");
+        assert!(r.prekey.is_none());
+        assert_eq!(alice.recv(&bob, &r).unwrap(), "привет, Алиса");
+
+        // После ответа X3DH-заголовок больше не прикладывается.
+        let m = alice.send(&bob, "как дела?");
+        assert!(m.prekey.is_none());
+        assert_eq!(bob.recv(&alice, &m).unwrap(), "как дела?");
+    }
+}
+
+#[test]
+fn long_conversation() {
+    let (mut alice, mut bob) = pair();
+    alice.start(&mut bob, true);
+    for i in 0..50 {
+        let m = alice.send(&bob, &format!("a{i}"));
+        assert_eq!(bob.recv(&alice, &m).unwrap(), format!("a{i}"));
+        if i % 3 == 0 {
+            let r = bob.send(&alice, &format!("b{i}"));
+            assert_eq!(alice.recv(&bob, &r).unwrap(), format!("b{i}"));
+        }
+    }
+}
+
+#[test]
+fn several_messages_before_reply_arrive_out_of_order() {
+    let (mut alice, mut bob) = pair();
+    alice.start(&mut bob, true);
+    let msgs: Vec<_> = (0..4).map(|i| alice.send(&bob, &i.to_string())).collect();
+    // Пока Боб офлайн, все сообщения несут один и тот же X3DH-заголовок.
+    assert!(msgs.iter().all(|m| m.prekey == msgs[0].prekey));
+
+    assert_eq!(bob.recv(&alice, &msgs[2]).unwrap(), "2");
+    assert_eq!(bob.recv(&alice, &msgs[0]).unwrap(), "0");
+    assert_eq!(bob.recv(&alice, &msgs[3]).unwrap(), "3");
+    assert_eq!(bob.recv(&alice, &msgs[1]).unwrap(), "1");
     assert_eq!(
-        alice.decrypt(&env, &bob.sign_public_bytes()).unwrap(),
-        b"hello alice"
+        bob.sessions["alice"].len(),
+        1,
+        "all four belong to one session"
     );
 }
 
 #[test]
-fn roundtrip_through_json_wire_format() {
-    let (alice, bob) = pair();
-    let env = alice
-        .encrypt_to("bob", &bob.x_public_bytes(), "привет 👋".as_bytes())
-        .unwrap();
+fn replayed_first_message_is_rejected() {
+    let (mut alice, mut bob) = pair();
+    alice.start(&mut bob, false); // без OPK — самый уязвимый к повтору случай
+    let first = alice.send(&bob, "hi");
+    bob.recv(&alice, &first).unwrap();
+    assert_eq!(bob.recv(&alice, &first), Err(CryptoError::Replay));
 
-    let json = serde_json::to_string(&EnvelopeB64::from(&env)).unwrap();
-    let back = Envelope::try_from(serde_json::from_str::<EnvelopeB64>(&json).unwrap()).unwrap();
+    // Даже если сессия давно вытеснена из памяти.
+    bob.sessions.clear();
+    assert_eq!(bob.recv(&alice, &first), Err(CryptoError::Replay));
+}
 
-    let pt = bob.decrypt(&back, &alice.sign_public_bytes()).unwrap();
-    assert_eq!(String::from_utf8(pt).unwrap(), "привет 👋");
+#[test]
+fn reused_one_time_prekey_is_rejected() {
+    let (mut alice, mut bob) = pair();
+    let mut carol = Party::new("carol");
+    let bundle = bob.bundle(true);
+    for p in [&mut alice, &mut carol] {
+        let set = p.sessions.entry("bob".into()).or_default();
+        p.id.start_session(&bob.keys(), &bundle, set).unwrap();
+    }
+    let from_alice = alice.send(&bob, "a");
+    let from_carol = carol.send(&bob, "c");
+    bob.recv(&alice, &from_alice).unwrap();
+    // Релей должен был отдать OPK только одному; второй, получивший тот же, получит отказ.
+    assert_eq!(
+        bob.recv(&carol, &from_carol),
+        Err(CryptoError::UnknownPrekey)
+    );
+}
+
+#[test]
+fn rotated_signed_prekey_still_works_for_queued_messages() {
+    let (mut alice, mut bob) = pair();
+    alice.start(&mut bob, false);
+    let queued = alice.send(&bob, "лежало на релее");
+    bob.rotate_spk();
+    assert_eq!(bob.recv(&alice, &queued).unwrap(), "лежало на релее");
+
+    // А если старый предключ уже удалён — честная ошибка.
+    let (mut alice, mut bob) = pair();
+    alice.start(&mut bob, false);
+    let queued = alice.send(&bob, "слишком старое");
+    bob.spk_secrets.remove(&1);
+    assert_eq!(bob.recv(&alice, &queued), Err(CryptoError::UnknownPrekey));
+}
+
+#[test]
+fn substituted_prekey_is_detected() {
+    // Злой релей подсовывает свой предключ вместо предключа Боба.
+    let (alice, mut bob) = pair();
+    let mallory = Identity::generate("mallory");
+    let (_, fake) = mallory.new_signed_prekey(1);
+    let mut bundle = bob.bundle(true);
+    bundle.signed_prekey = fake;
+    let mut set = SessionSet::default();
+    assert_eq!(
+        alice.id.start_session(&bob.keys(), &bundle, &mut set),
+        Err(CryptoError::BadSignature)
+    );
+    assert!(set.is_empty());
+}
+
+#[test]
+fn simultaneous_start_converges() {
+    // Оба начали переписку, не дождавшись друг друга — в любом порядке доставки.
+    for alice_reads_first in [true, false] {
+        simultaneous_case(alice_reads_first);
+    }
+}
+
+fn simultaneous_case(alice_reads_first: bool) {
+    let (mut alice, mut bob) = pair();
+    alice.start(&mut bob, true);
+    bob.start(&mut alice, true);
+    let a1 = alice.send(&bob, "a1");
+    let b1 = bob.send(&alice, "b1");
+    if alice_reads_first {
+        assert_eq!(alice.recv(&bob, &b1).unwrap(), "b1");
+        assert_eq!(bob.recv(&alice, &a1).unwrap(), "a1");
+    } else {
+        assert_eq!(bob.recv(&alice, &a1).unwrap(), "a1");
+        assert_eq!(alice.recv(&bob, &b1).unwrap(), "b1");
+    }
+
+    // Дальше переписка идёт нормально в обе стороны.
+    for i in 0..5 {
+        let m = alice.send(&bob, &format!("a{i}"));
+        assert_eq!(bob.recv(&alice, &m).unwrap(), format!("a{i}"));
+        let m = bob.send(&alice, &format!("b{i}"));
+        assert_eq!(alice.recv(&bob, &m).unwrap(), format!("b{i}"));
+    }
+    // И обе стороны пишут через одну и ту же сессию: X3DH-заголовки исчезли.
+    assert!(alice.send(&bob, "x").prekey.is_none());
+    assert!(bob.send(&alice, "y").prekey.is_none());
+}
+
+#[test]
+fn simultaneous_start_when_one_first_message_is_lost() {
+    let (mut alice, mut bob) = pair();
+    alice.start(&mut bob, true);
+    bob.start(&mut alice, true);
+    let _lost = alice.send(&bob, "a1 (lost)");
+    let b1 = bob.send(&alice, "b1");
+    assert_eq!(alice.recv(&bob, &b1).unwrap(), "b1");
+    // Алиса продолжает писать, Боб отвечает — переписка налаживается.
+    let a2 = alice.send(&bob, "a2");
+    assert_eq!(bob.recv(&alice, &a2).unwrap(), "a2");
+    let b2 = bob.send(&alice, "b2");
+    assert_eq!(alice.recv(&bob, &b2).unwrap(), "b2");
+    let a3 = alice.send(&bob, "a3");
+    assert_eq!(bob.recv(&alice, &a3).unwrap(), "a3");
+}
+
+#[test]
+fn new_session_after_peer_lost_state() {
+    // Алиса переустановила клиент и начала новую сессию; Боб принимает и её,
+    // и запоздавшие сообщения старой.
+    let (mut alice, mut bob) = pair();
+    alice.start(&mut bob, true);
+    let old1 = alice.send(&bob, "old 1");
+    bob.recv(&alice, &old1).unwrap();
+    let late = alice.send(&bob, "old 2 (late)");
+
+    alice.sessions.clear();
+    alice.start(&mut bob, true);
+    let new = alice.send(&bob, "new");
+    assert_eq!(bob.recv(&alice, &new).unwrap(), "new");
+    assert_eq!(bob.recv(&alice, &late).unwrap(), "old 2 (late)");
+
+    // Боб отвечает через самую свежую сессию, и Алиса это читает.
+    let r = bob.send(&alice, "reply");
+    assert_eq!(alice.recv(&bob, &r).unwrap(), "reply");
+}
+
+#[test]
+fn forged_and_misdirected_envelopes_are_rejected() {
+    let (mut alice, mut bob) = pair();
+    let mut carol = Party::new("carol");
+    alice.start(&mut bob, true);
+    let m = alice.send(&bob, "for bob");
+
+    // Чужой получатель.
+    assert_eq!(
+        carol.recv(&alice, &m),
+        Err(CryptoError::WrongRecipient("bob".into()))
+    );
+
+    // Изменённый шифротекст или заголовок — подпись не сходится.
+    let mut tampered = m.clone();
+    tampered.body[0] ^= 1;
+    assert_eq!(bob.recv(&alice, &tampered), Err(CryptoError::BadSignature));
+    let mut tampered = m.clone();
+    tampered.header.n += 1;
+    assert_eq!(bob.recv(&alice, &tampered), Err(CryptoError::BadSignature));
+
+    // Мэллори переподписала конверт Алисы от своего имени: подпись верна,
+    // но заголовок привязан к шифротексту, и X3DH не сходится.
+    let mallory = Party::new("mallory");
+    let mut stolen = m.clone();
+    stolen.from = "mallory".into();
+    stolen.sig = mallory.id.sign(&stolen.signing_bytes());
+    assert!(verify_envelope(&stolen, &mallory.id.sign_public_bytes()).is_ok());
+    assert!(bob.recv(&mallory, &stolen).is_err());
+
+    // Сессия Боба с Алисой от всего этого не пострадала.
+    assert_eq!(bob.recv(&alice, &m).unwrap(), "for bob");
+}
+
+#[test]
+fn no_session_and_limits() {
+    let (mut alice, bob) = pair();
+    let mut empty = SessionSet::default();
+    assert_eq!(
+        alice.id.seal(&bob.keys(), &mut empty, b"x").unwrap_err(),
+        CryptoError::NoSession
+    );
+
+    let mut bob = bob;
+    alice.start(&mut bob, true);
+    let set = alice.sessions.get_mut("bob").unwrap();
+    let big = vec![0u8; MAX_PLAINTEXT_LEN + 1];
+    assert_eq!(
+        alice.id.seal(&bob.keys(), set, &big).unwrap_err(),
+        CryptoError::MessageTooLarge(MAX_PLAINTEXT_LEN + 1)
+    );
+    assert!(
+        alice
+            .id
+            .seal(&bob.keys(), set, &big[..MAX_PLAINTEXT_LEN])
+            .is_ok()
+    );
+}
+
+#[test]
+fn session_count_is_bounded() {
+    let (mut alice, mut bob) = pair();
+    for _ in 0..10 {
+        alice.start(&mut bob, false);
+    }
+    assert_eq!(
+        alice.sessions["bob"].len(),
+        crypto_core::session::MAX_SESSIONS
+    );
+}
+
+#[test]
+fn corrupt_state_is_reported() {
+    assert_eq!(
+        SessionSet::from_json("{nope").unwrap_err(),
+        CryptoError::CorruptState
+    );
 }
 
 #[test]
@@ -51,101 +402,17 @@ fn restored_identity_is_the_same_identity() {
 }
 
 #[test]
-fn every_encryption_is_unique() {
-    let (alice, bob) = pair();
-    let a = alice
-        .encrypt_to("bob", &bob.x_public_bytes(), b"same")
-        .unwrap();
-    let b = alice
-        .encrypt_to("bob", &bob.x_public_bytes(), b"same")
-        .unwrap();
-    assert_ne!(a.eph_pub, b.eph_pub);
-    assert_ne!(a.body, b.body);
-}
-
-#[test]
-fn tampered_body_is_rejected() {
-    let (alice, bob) = pair();
-    let mut env = alice
-        .encrypt_to("bob", &bob.x_public_bytes(), b"pay 10")
-        .unwrap();
-    env.body[0] ^= 0x01;
+fn envelope_id_is_stable_and_unique() {
+    let (mut alice, mut bob) = pair();
+    alice.start(&mut bob, true);
+    let a = alice.send(&bob, "x");
+    let b = alice.send(&bob, "x");
     assert_eq!(
-        bob.decrypt(&env, &alice.sign_public_bytes()),
-        Err(CryptoError::BadSignature)
+        crypto_core::envelope_id(&a),
+        crypto_core::envelope_id(&a.clone())
     );
-}
-
-#[test]
-fn signature_from_someone_else_is_rejected() {
-    let (alice, bob) = pair();
-    let mallory = Identity::generate("mallory");
-    let env = mallory
-        .encrypt_to("bob", &bob.x_public_bytes(), b"I am alice")
-        .unwrap();
-    // Боб проверяет ключом Алисы из своей базы — подпись не сходится.
-    assert_eq!(
-        bob.decrypt(&env, &alice.sign_public_bytes()),
-        Err(CryptoError::BadSignature)
-    );
-}
-
-#[test]
-fn resigned_envelope_with_forged_sender_does_not_decrypt() {
-    // Мэллори перехватила конверт Алисы, поменяла `from` на себя и подписала своим ключом.
-    // Подпись валидна, но заголовок привязан к шифротексту через AAD.
-    let (alice, bob) = pair();
-    let mallory = Identity::generate("mallory");
-    let mut env = alice
-        .encrypt_to("bob", &bob.x_public_bytes(), b"secret")
-        .unwrap();
-    env.from = "mallory".into();
-    env.sig = mallory.sign(&env.signing_bytes());
-
-    assert!(verify_envelope(&env, &mallory.sign_public_bytes()).is_ok());
-    assert_eq!(
-        bob.decrypt(&env, &mallory.sign_public_bytes()),
-        Err(CryptoError::DecryptFailed)
-    );
-}
-
-#[test]
-fn envelope_for_someone_else_is_rejected() {
-    let (alice, bob) = pair();
-    let carol = Identity::generate("carol");
-    let env = alice
-        .encrypt_to("carol", &carol.x_public_bytes(), b"hi carol")
-        .unwrap();
-    assert_eq!(
-        bob.decrypt(&env, &alice.sign_public_bytes()),
-        Err(CryptoError::WrongRecipient("carol".into()))
-    );
-}
-
-#[test]
-fn low_order_peer_key_is_rejected() {
-    let alice = Identity::generate("alice");
-    assert_eq!(
-        alice.encrypt_to("bob", &[0u8; 32], b"x").unwrap_err(),
-        CryptoError::InvalidPeerKey
-    );
-}
-
-#[test]
-fn oversized_message_is_rejected() {
-    let (alice, bob) = pair();
-    let big = vec![0u8; MAX_PLAINTEXT_LEN + 1];
-    assert_eq!(
-        alice
-            .encrypt_to("bob", &bob.x_public_bytes(), &big)
-            .unwrap_err(),
-        CryptoError::MessageTooLarge(MAX_PLAINTEXT_LEN + 1)
-    );
-    assert!(
-        alice
-            .encrypt_to("bob", &bob.x_public_bytes(), &big[..MAX_PLAINTEXT_LEN])
-            .is_ok()
-    );
+    assert_ne!(crypto_core::envelope_id(&a), crypto_core::envelope_id(&b));
+    assert_eq!(crypto_core::envelope_id(&a).len(), 32);
 }
 
 #[test]
@@ -169,23 +436,6 @@ fn contact_card_verifies_and_detects_tampering() {
 }
 
 #[test]
-fn envelope_id_is_stable_and_unique() {
-    let (alice, bob) = pair();
-    let a = alice
-        .encrypt_to("bob", &bob.x_public_bytes(), b"x")
-        .unwrap();
-    let b = alice
-        .encrypt_to("bob", &bob.x_public_bytes(), b"x")
-        .unwrap();
-    assert_eq!(
-        crypto_core::envelope_id(&a),
-        crypto_core::envelope_id(&a.clone())
-    );
-    assert_ne!(crypto_core::envelope_id(&a), crypto_core::envelope_id(&b));
-    assert_eq!(crypto_core::envelope_id(&a).len(), 32);
-}
-
-#[test]
 fn new_accounts_have_key_derived_ids() {
     let a = Identity::generate_new();
     assert!(crypto_core::is_key_derived_account_id(a.account_id()));
@@ -195,7 +445,6 @@ fn new_accounts_have_key_derived_ids() {
     );
     assert_ne!(a.account_id(), Identity::generate_new().account_id());
 
-    // Старые UUID и тестовые имена — не «из ключа».
     assert!(!crypto_core::is_key_derived_account_id(
         "2d723969-b478-4ff4-af0a-477541df0441"
     ));
@@ -206,7 +455,6 @@ fn new_accounts_have_key_derived_ids() {
 fn card_cannot_claim_someone_elses_derived_id() {
     let alice = Identity::generate_new();
     let mallory = Identity::generate_new();
-    // Мэллори делает карточку с ID Алисы, но своими ключами и своей подписью.
     let payload = protocol::ContactCardPayload {
         account_id: alice.account_id().into(),
         username: Some("@alice".into()),
@@ -219,7 +467,6 @@ fn card_cannot_claim_someone_elses_derived_id() {
         verify_contact_card(&card),
         Err(CryptoError::AccountIdMismatch)
     );
-
     assert!(verify_contact_card(&alice.contact_card(None)).is_ok());
 }
 

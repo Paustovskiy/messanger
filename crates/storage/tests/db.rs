@@ -26,6 +26,7 @@ fn contact(account_id: &str, username: Option<&str>) -> ContactRow {
         username: username.map(Into::into),
         public: id.x_public_bytes(),
         sign_public: Some(id.sign_public_bytes()),
+        signed_prekey: None,
     }
 }
 
@@ -278,6 +279,8 @@ fn migrates_database_from_previous_version() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, SCHEMA_VERSION);
+    // v4: таблицы сессий появились и пусты.
+    assert!(db.load_sessions("bob").unwrap().is_none());
 }
 
 /// Самая первая схема с `user_id` вместо `account_id` и без ключа подписи.
@@ -323,4 +326,174 @@ fn database_file_is_private() {
     Db::open(&path).unwrap();
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn contact_keeps_signed_prekey_until_a_newer_one_arrives() {
+    let db = Db::open_in_memory().unwrap();
+    let spk = StoredPrekey {
+        id: 3,
+        public: [1; 32],
+        sig: [2; 64],
+    };
+    db.upsert_contact(&ContactRow {
+        signed_prekey: Some(spk),
+        ..contact("bob", Some("@bobby"))
+    })
+    .unwrap();
+    assert_eq!(
+        db.get_contact("bob").unwrap().unwrap().signed_prekey,
+        Some(spk)
+    );
+
+    // Повторное добавление карточки без предключа не стирает известный.
+    db.upsert_contact(&contact("bob", Some("@bobby"))).unwrap();
+    assert_eq!(
+        db.get_contact("bob").unwrap().unwrap().signed_prekey,
+        Some(spk)
+    );
+
+    let newer = StoredPrekey {
+        id: 4,
+        public: [3; 32],
+        sig: [4; 64],
+    };
+    db.upsert_contact(&ContactRow {
+        signed_prekey: Some(newer),
+        ..contact("bob", Some("@bobby"))
+    })
+    .unwrap();
+    assert_eq!(
+        db.get_contact("bob").unwrap().unwrap().signed_prekey,
+        Some(newer)
+    );
+}
+
+#[test]
+fn sessions_and_replay_markers() {
+    let db = Db::open_in_memory().unwrap();
+    assert!(db.load_sessions("bob").unwrap().is_none());
+    db.save_sessions("bob", "{\"v\":1}").unwrap();
+    db.save_sessions("bob", "{\"v\":2}").unwrap();
+    assert_eq!(
+        db.load_sessions("bob").unwrap().as_deref(),
+        Some("{\"v\":2}")
+    );
+    db.delete_sessions("bob").unwrap();
+    assert!(db.load_sessions("bob").unwrap().is_none());
+
+    assert!(!db.is_ek_used("bob", &[1; 32]).unwrap());
+    db.mark_ek_used("bob", &[1; 32]).unwrap();
+    db.mark_ek_used("bob", &[1; 32]).unwrap();
+    assert!(db.is_ek_used("bob", &[1; 32]).unwrap());
+    assert!(!db.is_ek_used("carol", &[1; 32]).unwrap());
+
+    db.insert_message(&msg(Direction::In, "bob", "x", "m1"))
+        .unwrap();
+    assert!(db.has_incoming("bob", "m1").unwrap());
+    assert!(!db.has_incoming("bob", "m2").unwrap());
+    assert!(!db.has_incoming("carol", "m1").unwrap());
+}
+
+#[test]
+fn own_prekeys() {
+    let db = Db::open_in_memory().unwrap();
+    assert!(db.current_signed_prekey().unwrap().is_none());
+    assert_eq!(db.next_signed_prekey_id().unwrap(), 1);
+    for (id, created_at) in [(1, 100), (2, 200), (3, 300)] {
+        db.insert_signed_prekey(&OwnSignedPrekey {
+            id,
+            secret: [id as u8; 32],
+            public: [0; 32],
+            sig: [0; 64],
+            created_at,
+        })
+        .unwrap();
+    }
+    assert_eq!(db.current_signed_prekey().unwrap().unwrap().id, 3);
+    assert_eq!(db.signed_prekey_secret(2).unwrap(), Some([2; 32]));
+    assert_eq!(db.prune_signed_prekeys(250).unwrap(), 2);
+    assert_eq!(db.signed_prekey_secret(2).unwrap(), None);
+    // Самый свежий не удаляется, даже если он «старый».
+    assert_eq!(db.prune_signed_prekeys(10_000).unwrap(), 0);
+    assert_eq!(db.next_signed_prekey_id().unwrap(), 4);
+
+    assert_eq!(db.next_one_time_prekey_id().unwrap(), 1);
+    let keys: Vec<_> = (1..=3)
+        .map(|id| OwnOneTimePrekey {
+            id,
+            secret: [id as u8; 32],
+            public: [0; 32],
+        })
+        .collect();
+    db.insert_one_time_prekeys(&keys).unwrap();
+    assert_eq!(db.count_one_time_prekeys().unwrap(), 3);
+    assert_eq!(db.one_time_prekey_secret(2).unwrap(), Some([2; 32]));
+    db.delete_one_time_prekey(3).unwrap();
+    assert_eq!(db.one_time_prekey_secret(3).unwrap(), None);
+    // ID не переиспользуются, даже если последний ключ удалён.
+    assert_eq!(db.next_one_time_prekey_id().unwrap(), 4);
+}
+
+#[test]
+fn failed_messages_leave_the_outbox() {
+    let db = Db::open_in_memory().unwrap();
+    db.insert_message(&msg(Direction::Out, "bob", "old format", "m1"))
+        .unwrap();
+    db.mark_out_failed("bob", "m1").unwrap();
+    assert!(db.list_pending_outgoing(10).unwrap().is_empty());
+    assert_eq!(
+        db.list_messages_for_peer("bob", 10).unwrap()[0].status,
+        DeliveryStatus::Failed
+    );
+}
+
+#[test]
+fn immediate_rolls_back_on_error() {
+    let db = Db::open_in_memory().unwrap();
+    let r: anyhow::Result<()> = db.immediate(|| {
+        db.save_sessions("bob", "half-written")?;
+        anyhow::bail!("decryption failed")
+    });
+    assert!(r.is_err());
+    assert!(db.load_sessions("bob").unwrap().is_none());
+
+    db.immediate(|| db.save_sessions("bob", "ok")).unwrap();
+    assert_eq!(db.load_sessions("bob").unwrap().as_deref(), Some("ok"));
+}
+
+/// Два процесса (`listen` и `send`) с одной базой: каждый читает состояние,
+/// меняет и записывает. Без эксклюзивной транзакции часть обновлений терялась бы.
+#[test]
+fn concurrent_writers_do_not_lose_updates() {
+    let path = tmp_path("concurrent");
+    Db::open(&path).unwrap().save_sessions("bob", "0").unwrap();
+
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let db = Db::open(&path).unwrap();
+                for _ in 0..25 {
+                    db.immediate(|| {
+                        let n: u32 = db.load_sessions("bob")?.unwrap().parse()?;
+                        std::thread::yield_now();
+                        db.save_sessions("bob", &(n + 1).to_string())
+                    })
+                    .unwrap();
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+    assert_eq!(
+        Db::open(&path)
+            .unwrap()
+            .load_sessions("bob")
+            .unwrap()
+            .as_deref(),
+        Some("100")
+    );
 }

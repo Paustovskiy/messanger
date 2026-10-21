@@ -27,7 +27,10 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMessage, Envelope, ServerMessage, b64, check_id, decode_fixed};
+use protocol::{
+    ClientMessage, Envelope, OneTimePrekey, OneTimePrekeyB64, ServerMessage, SignedPrekey,
+    SignedPrekeyB64, b64, check_id, decode_fixed,
+};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +52,8 @@ pub struct Config {
     pub max_queue_per_recipient: usize,
     /// Сколько ждать входа после подключения.
     pub auth_timeout: Duration,
+    /// Сколько одноразовых предключей храним на аккаунт.
+    pub max_one_time_prekeys: usize,
     /// Максимальный размер одного WebSocket-сообщения.
     pub max_frame_bytes: usize,
     /// Как часто пинговать клиента. Если от клиента ничего не слышно три
@@ -63,6 +68,7 @@ impl Default for Config {
             message_ttl: Duration::from_secs(30 * 24 * 3600),
             max_queue_per_recipient: 1000,
             auth_timeout: Duration::from_secs(10),
+            max_one_time_prekeys: 200,
             max_frame_bytes: 128 * 1024,
             ping_interval: Duration::from_secs(30),
         }
@@ -78,7 +84,9 @@ struct Inner {
     config: Config,
     store: Store,
     /// Кто сейчас онлайн: account_id → канал в его сокет.
-    online: DashMap<String, Client>,
+    /// У одного аккаунта может быть несколько соединений одновременно
+    /// (например, `listen` и `send` в соседних терминалах) — шлём всем.
+    online: DashMap<String, Vec<Client>>,
     next_conn_id: AtomicU64,
 }
 
@@ -117,12 +125,17 @@ impl Relay {
         Ok(result?)
     }
 
-    /// Отправить JSON в сокет получателя, если он онлайн.
+    /// Отправить JSON во все соединения получателя. `true`, если хоть одно живо.
     fn push(&self, account_id: &str, json: String) -> bool {
-        self.0
-            .online
-            .get(account_id)
-            .is_some_and(|c| c.tx.send(json).is_ok())
+        let Some(clients) = self.0.online.get(account_id) else {
+            return false;
+        };
+        // Именно во все: короткое замыкание (`any`) пропустило бы остальные соединения.
+        let mut delivered = false;
+        for c in clients.iter() {
+            delivered |= c.tx.send(json.clone()).is_ok();
+        }
+        delivered
     }
 }
 
@@ -240,19 +253,19 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
         return;
     };
 
-    relay.0.online.insert(
-        me.clone(),
-        Client {
-            conn_id,
-            tx: tx.clone(),
-        },
-    );
+    relay.0.online.entry(me.clone()).or_default().push(Client {
+        conn_id,
+        tx: tx.clone(),
+    });
     let _ = tx.send(to_json(&ServerMessage::Authenticated {
         account_id: me.clone(),
     }));
     info!(account_id = %me, conn_id, "client authenticated");
 
-    flush_queue(&relay, &me);
+    flush_queue(&relay, &me, &tx);
+    // Статус предключей идёт после очереди и заодно говорит клиенту:
+    // «всё, что накопилось, ты уже получил».
+    let _ = tx.send(prekey_status(&relay, &me));
 
     // --- 2. основной цикл ------------------------------------------------
     while let Some(msg) = next_msg().await {
@@ -267,6 +280,17 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
                     let _ = tx.send(reply);
                 }
                 Ok(ClientMessage::Ack { to, msg_id }) => handle_ack(&relay, &me, &to, &msg_id),
+                Ok(ClientMessage::PublishPrekeys {
+                    signed_prekey,
+                    one_time,
+                }) => {
+                    let reply =
+                        handle_publish(&relay, &me, &my_sign_pub, &signed_prekey, &one_time);
+                    let _ = tx.send(reply);
+                }
+                Ok(ClientMessage::FetchBundle { account_id }) => {
+                    let _ = tx.send(handle_fetch_bundle(&relay, &account_id));
+                }
                 Ok(ClientMessage::Auth { .. }) => {
                     let _ = tx.send(error("already authenticated", None));
                 }
@@ -279,9 +303,15 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
         }
     }
 
-    // Убираем из онлайна, только если это всё ещё наше соединение:
-    // клиент мог уже переподключиться, и новый сокет трогать нельзя.
-    relay.0.online.remove_if(&me, |_, c| c.conn_id == conn_id);
+    // Убираем из онлайна только это соединение: остальные соединения
+    // того же аккаунта (другой терминал, переподключение) продолжают работать.
+    if let Some(mut clients) = relay.0.online.get_mut(&me) {
+        clients.retain(|c| c.conn_id != conn_id);
+    }
+    relay
+        .0
+        .online
+        .remove_if(&me, |_, clients| clients.is_empty());
     info!(account_id = %me, conn_id, "client disconnected");
     drop(tx);
     writer.abort();
@@ -321,7 +351,8 @@ fn authenticate(
     }
 }
 
-fn flush_queue(relay: &Relay, me: &str) {
+/// Отдать накопившуюся очередь новому соединению (остальные её уже получали).
+fn flush_queue(relay: &Relay, me: &str, tx: &mpsc::UnboundedSender<String>) {
     let items = match relay.0.store.pending_for(me) {
         Ok(items) => items,
         Err(e) => {
@@ -333,7 +364,7 @@ fn flush_queue(relay: &Relay, me: &str) {
         debug!(account_id = me, count = items.len(), "flushing queue");
     }
     for item in items {
-        if !relay.push(me, item.payload) {
+        if tx.send(item.payload).is_err() {
             break; // клиент уже отвалился — остальное доставим в следующий раз
         }
         // Конверты ждут ack получателя, уведомления о доставке — нет.
@@ -418,6 +449,85 @@ fn handle_ack(relay: &Relay, me: &str, to: &str, msg_id: &str) {
             .enqueue(to, me, msg_id, Kind::DeliverAck, &ack, max)
         {
             warn!("cannot queue delivery ack: {e:#}");
+        }
+    }
+}
+
+fn prekey_status(relay: &Relay, me: &str) -> String {
+    match relay.0.store.prekey_status(me) {
+        Ok((has_signed_prekey, one_time_left)) => to_json(&ServerMessage::PrekeyStatus {
+            has_signed_prekey,
+            one_time_left,
+        }),
+        Err(e) => {
+            warn!("prekey status failed: {e:#}");
+            error("internal error", None)
+        }
+    }
+}
+
+fn handle_publish(
+    relay: &Relay,
+    me: &str,
+    my_sign_pub: &[u8; 32],
+    signed: &SignedPrekeyB64,
+    one_time: &[OneTimePrekeyB64],
+) -> String {
+    if one_time.len() > protocol::MAX_ONE_TIME_PREKEYS_PER_UPLOAD {
+        return error("too many one-time prekeys in one upload", None);
+    }
+    let signed = match SignedPrekey::try_from(signed) {
+        Ok(k) => k,
+        Err(e) => return error(format!("bad signed prekey: {e}"), None),
+    };
+    // Релей не принимает предключи, не подписанные владельцем аккаунта.
+    if crypto_core::verify_signed_prekey(my_sign_pub, &signed).is_err() {
+        return error("signed prekey is not signed by this account", None);
+    }
+    let one_time: Result<Vec<OneTimePrekey>, _> =
+        one_time.iter().map(OneTimePrekey::try_from).collect();
+    let one_time = match one_time {
+        Ok(k) => k,
+        Err(e) => return error(format!("bad one-time prekey: {e}"), None),
+    };
+    match relay
+        .0
+        .store
+        .publish_prekeys(me, &signed, &one_time, relay.0.config.max_one_time_prekeys)
+    {
+        Ok(left) => to_json(&ServerMessage::PrekeyStatus {
+            has_signed_prekey: true,
+            one_time_left: left,
+        }),
+        Err(e) => {
+            warn!("publish prekeys failed: {e:#}");
+            error("internal error", None)
+        }
+    }
+}
+
+fn handle_fetch_bundle(relay: &Relay, account_id: &str) -> String {
+    if let Err(e) = check_id(account_id, "account_id") {
+        return error(e.to_string(), None);
+    }
+    match relay.0.store.take_bundle(account_id) {
+        Ok(bundle) => {
+            let (signed_prekey, one_time) = match bundle {
+                Some((s, o)) => (
+                    Some(SignedPrekeyB64::from(&s)),
+                    o.as_ref().map(OneTimePrekeyB64::from),
+                ),
+                None => (None, None),
+            };
+            to_json(&ServerMessage::Bundle {
+                account_id: account_id.to_owned(),
+                signed_prekey,
+                one_time,
+            })
+        }
+        Err(e) => {
+            warn!("fetch bundle failed: {e:#}");
+            error("internal error", None)
         }
     }
 }

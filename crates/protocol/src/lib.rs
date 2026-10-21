@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Текущая версия формата конверта.
-pub const ENVELOPE_VERSION: u8 = 1;
+pub const ENVELOPE_VERSION: u8 = 2;
 
 /// Максимальный размер открытого текста одного сообщения (байт).
 pub const MAX_PLAINTEXT_LEN: usize = 32 * 1024;
@@ -25,9 +25,13 @@ pub const MAX_CIPHERTEXT_LEN: usize = MAX_PLAINTEXT_LEN + 16;
 /// Максимальная длина `account_id` и `msg_id` в протоколе релея.
 pub const MAX_ID_LEN: usize = 64;
 
-const DOMAIN_ENVELOPE_SIG: &[u8] = b"messenger/envelope-sig/v1";
-const DOMAIN_ENVELOPE_AAD: &[u8] = b"messenger/envelope-aad/v1";
+/// Сколько одноразовых предключей можно передать за один раз.
+pub const MAX_ONE_TIME_PREKEYS_PER_UPLOAD: usize = 100;
+
+const DOMAIN_ENVELOPE_SIG: &[u8] = b"messenger/envelope-sig/v2";
+const DOMAIN_ENVELOPE_HEADER: &[u8] = b"messenger/envelope-header/v2";
 const DOMAIN_RELAY_AUTH: &[u8] = b"messenger/relay-auth/v1";
+const DOMAIN_SIGNED_PREKEY: &[u8] = b"messenger/signed-prekey/v1";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -57,63 +61,103 @@ pub enum ProtocolError {
 // Конверт
 // ---------------------------------------------------------------------------
 
+/// Заголовок «первого сообщения» (X3DH): по нему получатель вычисляет общий
+/// секрет, даже если отправитель писал, пока получатель был офлайн.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreKeyHeader {
+    /// Одноразовый X25519-ключ отправителя для X3DH.
+    pub ek_pub: [u8; 32],
+    /// Какой подписанный предключ получателя использован.
+    pub spk_id: u32,
+    /// Какой одноразовый предключ получателя использован (если был).
+    pub opk_id: Option<u32>,
+}
+
+/// Заголовок Double Ratchet: текущий ratchet-ключ отправителя и номера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RatchetHeader {
+    pub dh_pub: [u8; 32],
+    /// Длина предыдущей цепочки отправки.
+    pub pn: u32,
+    /// Номер сообщения в текущей цепочке.
+    pub n: u32,
+}
+
 /// Зашифрованное сообщение от `from` к `to` (оба — `account_id`).
 ///
-/// * `eph_pub` — одноразовый X25519-ключ отправителя;
-/// * `body` — шифротекст ChaCha20-Poly1305, заголовок (`from`, `to`, `eph_pub`)
-///   привязан к нему как AAD;
-/// * `sig` — Ed25519-подпись отправителя над [`envelope_signing_bytes`].
+/// * `prekey` — есть только в первых сообщениях сессии;
+/// * `header` — заголовок Double Ratchet;
+/// * `body` — шифротекст ChaCha20-Poly1305, весь заголовок привязан к нему как AAD;
+/// * `sig` — Ed25519-подпись отправителя над [`Envelope::signing_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
     pub from: String,
     pub to: String,
-    pub eph_pub: [u8; 32],
-    pub nonce: [u8; 12],
+    pub prekey: Option<PreKeyHeader>,
+    pub header: RatchetHeader,
     pub body: Vec<u8>,
     pub sig: [u8; 64],
 }
 
 impl Envelope {
+    /// Канонические байты заголовка (всё, кроме шифротекста и подписи).
+    /// Идут в AEAD как associated data.
+    pub fn header_bytes(&self) -> Vec<u8> {
+        envelope_header_bytes(&self.from, &self.to, self.prekey.as_ref(), &self.header)
+    }
+
     /// Байты, которые подписывает отправитель.
     pub fn signing_bytes(&self) -> Vec<u8> {
-        envelope_signing_bytes(&self.from, &self.to, &self.eph_pub, &self.nonce, &self.body)
-    }
-
-    /// AAD для AEAD: связывает шифротекст с заголовком.
-    pub fn aad(&self) -> Vec<u8> {
-        envelope_aad(&self.from, &self.to, &self.eph_pub)
+        let header = self.header_bytes();
+        let mut out =
+            Vec::with_capacity(DOMAIN_ENVELOPE_SIG.len() + header.len() + self.body.len() + 8);
+        out.extend_from_slice(DOMAIN_ENVELOPE_SIG);
+        put_bytes(&mut out, &header);
+        put_bytes(&mut out, &self.body);
+        out
     }
 }
 
-/// AAD конверта. Если кто-то поменяет `from`/`to`/`eph_pub`, расшифровка упадёт.
-pub fn envelope_aad(from: &str, to: &str, eph_pub: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(DOMAIN_ENVELOPE_AAD.len() + from.len() + to.len() + 64);
-    out.extend_from_slice(DOMAIN_ENVELOPE_AAD);
-    out.push(ENVELOPE_VERSION);
-    put_bytes(&mut out, from.as_bytes());
-    put_bytes(&mut out, to.as_bytes());
-    out.extend_from_slice(eph_pub);
-    out
-}
-
-/// Канонические байты для подписи конверта.
-pub fn envelope_signing_bytes(
+/// Канонические байты заголовка конверта.
+pub fn envelope_header_bytes(
     from: &str,
     to: &str,
-    eph_pub: &[u8; 32],
-    nonce: &[u8; 12],
-    body: &[u8],
+    prekey: Option<&PreKeyHeader>,
+    header: &RatchetHeader,
 ) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(DOMAIN_ENVELOPE_SIG.len() + from.len() + to.len() + body.len() + 80);
-    out.extend_from_slice(DOMAIN_ENVELOPE_SIG);
+    let mut out = Vec::with_capacity(DOMAIN_ENVELOPE_HEADER.len() + from.len() + to.len() + 128);
+    out.extend_from_slice(DOMAIN_ENVELOPE_HEADER);
     out.push(ENVELOPE_VERSION);
     put_bytes(&mut out, from.as_bytes());
     put_bytes(&mut out, to.as_bytes());
-    out.extend_from_slice(eph_pub);
-    out.extend_from_slice(nonce);
-    put_bytes(&mut out, body);
+    match prekey {
+        None => out.push(0),
+        Some(p) => {
+            out.push(1);
+            out.extend_from_slice(&p.ek_pub);
+            out.extend_from_slice(&p.spk_id.to_le_bytes());
+            match p.opk_id {
+                None => out.push(0),
+                Some(id) => {
+                    out.push(1);
+                    out.extend_from_slice(&id.to_le_bytes());
+                }
+            }
+        }
+    }
+    out.extend_from_slice(&header.dh_pub);
+    out.extend_from_slice(&header.pn.to_le_bytes());
+    out.extend_from_slice(&header.n.to_le_bytes());
     out
+}
+
+/// JSON-представление заголовка X3DH.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreKeyHeaderB64 {
+    pub ek_pub_b64: String,
+    pub spk_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opk_id: Option<u32>,
 }
 
 /// JSON-представление конверта: так он ходит по сети и хранится в базе.
@@ -123,8 +167,11 @@ pub struct EnvelopeB64 {
     pub v: u8,
     pub from: String,
     pub to: String,
-    pub eph_pub_b64: String,
-    pub nonce_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prekey: Option<PreKeyHeaderB64>,
+    pub dh_pub_b64: String,
+    pub pn: u32,
+    pub n: u32,
     pub body_b64: String,
     pub sig_b64: String,
 }
@@ -135,8 +182,14 @@ impl From<&Envelope> for EnvelopeB64 {
             v: ENVELOPE_VERSION,
             from: e.from.clone(),
             to: e.to.clone(),
-            eph_pub_b64: b64(e.eph_pub),
-            nonce_b64: b64(e.nonce),
+            prekey: e.prekey.map(|p| PreKeyHeaderB64 {
+                ek_pub_b64: b64(p.ek_pub),
+                spk_id: p.spk_id,
+                opk_id: p.opk_id,
+            }),
+            dh_pub_b64: b64(e.header.dh_pub),
+            pn: e.header.pn,
+            n: e.header.n,
             body_b64: b64(&e.body),
             sig_b64: b64(e.sig),
         }
@@ -168,11 +221,24 @@ impl TryFrom<&EnvelopeB64> for Envelope {
             });
         }
 
+        let prekey = match &e.prekey {
+            None => None,
+            Some(p) => Some(PreKeyHeader {
+                ek_pub: decode_fixed::<32>(&p.ek_pub_b64, "prekey.ek_pub_b64")?,
+                spk_id: p.spk_id,
+                opk_id: p.opk_id,
+            }),
+        };
+
         Ok(Envelope {
             from: e.from.clone(),
             to: e.to.clone(),
-            eph_pub: decode_fixed::<32>(&e.eph_pub_b64, "eph_pub_b64")?,
-            nonce: decode_fixed::<12>(&e.nonce_b64, "nonce_b64")?,
+            prekey,
+            header: RatchetHeader {
+                dh_pub: decode_fixed::<32>(&e.dh_pub_b64, "dh_pub_b64")?,
+                pn: e.pn,
+                n: e.n,
+            },
             body,
             sig: decode_fixed::<64>(&e.sig_b64, "sig_b64")?,
         })
@@ -184,6 +250,90 @@ impl TryFrom<EnvelopeB64> for Envelope {
 
     fn try_from(e: EnvelopeB64) -> Result<Self, Self::Error> {
         Envelope::try_from(&e)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Предключи (prekeys)
+// ---------------------------------------------------------------------------
+
+/// Подписанный предключ: X25519-ключ, подписанный Ed25519-ключом владельца.
+/// Меняется периодически; по нему можно начать сессию, когда владелец офлайн.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedPrekey {
+    pub id: u32,
+    pub public: [u8; 32],
+    pub sig: [u8; 64],
+}
+
+impl SignedPrekey {
+    /// Байты, которые подписывает владелец.
+    pub fn signing_bytes(id: u32, public: &[u8; 32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(DOMAIN_SIGNED_PREKEY.len() + 36);
+        out.extend_from_slice(DOMAIN_SIGNED_PREKEY);
+        out.extend_from_slice(&id.to_le_bytes());
+        out.extend_from_slice(public);
+        out
+    }
+}
+
+/// Одноразовый предключ: используется ровно для одной новой сессии.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OneTimePrekey {
+    pub id: u32,
+    pub public: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedPrekeyB64 {
+    pub id: u32,
+    pub pub_b64: String,
+    pub sig_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OneTimePrekeyB64 {
+    pub id: u32,
+    pub pub_b64: String,
+}
+
+impl From<&SignedPrekey> for SignedPrekeyB64 {
+    fn from(k: &SignedPrekey) -> Self {
+        Self {
+            id: k.id,
+            pub_b64: b64(k.public),
+            sig_b64: b64(k.sig),
+        }
+    }
+}
+
+impl TryFrom<&SignedPrekeyB64> for SignedPrekey {
+    type Error = ProtocolError;
+    fn try_from(k: &SignedPrekeyB64) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: k.id,
+            public: decode_fixed::<32>(&k.pub_b64, "signed_prekey.pub_b64")?,
+            sig: decode_fixed::<64>(&k.sig_b64, "signed_prekey.sig_b64")?,
+        })
+    }
+}
+
+impl From<&OneTimePrekey> for OneTimePrekeyB64 {
+    fn from(k: &OneTimePrekey) -> Self {
+        Self {
+            id: k.id,
+            pub_b64: b64(k.public),
+        }
+    }
+}
+
+impl TryFrom<&OneTimePrekeyB64> for OneTimePrekey {
+    type Error = ProtocolError;
+    fn try_from(k: &OneTimePrekeyB64) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: k.id,
+            public: decode_fixed::<32>(&k.pub_b64, "one_time.pub_b64")?,
+        })
     }
 }
 
@@ -200,6 +350,10 @@ pub struct ContactCardV2 {
     pub x25519_pub_b64: String,
     pub ed25519_pub_b64: String,
     pub sig_b64: String,
+    /// Текущий подписанный предключ. Нужен, чтобы начать переписку без релея
+    /// (`send --offline`). Подписан отдельно, поэтому в подпись карточки не входит.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_prekey: Option<SignedPrekeyB64>,
 }
 
 /// Подписываемая часть карточки.
@@ -241,6 +395,7 @@ impl ContactCardV2 {
             x25519_pub_b64: b64(payload.x25519_pub),
             ed25519_pub_b64: b64(payload.ed25519_pub),
             sig_b64: b64(sig),
+            signed_prekey: None,
         }
     }
 
@@ -282,6 +437,15 @@ pub enum ClientMessage {
     },
     /// Подтвердить, что сообщение `msg_id` от `to` сохранено у получателя.
     Ack { to: String, msg_id: String },
+    /// Опубликовать свои предключи: подписанный заменяет прежний,
+    /// одноразовые добавляются к уже лежащим на релее.
+    PublishPrekeys {
+        signed_prekey: SignedPrekeyB64,
+        #[serde(default)]
+        one_time: Vec<OneTimePrekeyB64>,
+    },
+    /// Запросить набор предключей собеседника, чтобы начать с ним сессию.
+    FetchBundle { account_id: String },
 }
 
 /// Релей → клиент.
@@ -302,6 +466,23 @@ pub enum ServerMessage {
     },
     /// Получатель подтвердил доставку нашего сообщения.
     DeliverAck { from: String, msg_id: String },
+    /// Сколько наших предключей лежит на релее. Приходит после публикации и
+    /// после входа — в последнем случае **после** всей накопившейся очереди,
+    /// так что это ещё и знак «старые сообщения выданы полностью».
+    PrekeyStatus {
+        has_signed_prekey: bool,
+        one_time_left: u32,
+    },
+    /// Набор предключей собеседника. Одноразовый ключ выдаётся один раз
+    /// и сразу удаляется с релея. `signed_prekey: None` — собеседник ещё
+    /// не публиковал ключи.
+    Bundle {
+        account_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_prekey: Option<SignedPrekeyB64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        one_time: Option<OneTimePrekeyB64>,
+    },
     /// Ошибка. `msg_id` заполнен, если ошибка относится к конкретному `Send`.
     Error {
         message: String,
@@ -434,8 +615,16 @@ mod tests {
         Envelope {
             from: "alice".into(),
             to: "bob".into(),
-            eph_pub: [1; 32],
-            nonce: [2; 12],
+            prekey: Some(PreKeyHeader {
+                ek_pub: [5; 32],
+                spk_id: 7,
+                opk_id: Some(9),
+            }),
+            header: RatchetHeader {
+                dh_pub: [1; 32],
+                pn: 2,
+                n: 3,
+            },
             body: vec![3; 40],
             sig: [4; 64],
         }
@@ -443,11 +632,28 @@ mod tests {
 
     #[test]
     fn envelope_b64_roundtrip() {
-        let env = sample_envelope();
-        let wire = EnvelopeB64::from(&env);
-        let json = serde_json::to_string(&wire).unwrap();
-        let back: EnvelopeB64 = serde_json::from_str(&json).unwrap();
-        assert_eq!(Envelope::try_from(back).unwrap(), env);
+        for prekey in [
+            None,
+            Some(PreKeyHeader {
+                ek_pub: [5; 32],
+                spk_id: 7,
+                opk_id: None,
+            }),
+            Some(PreKeyHeader {
+                ek_pub: [5; 32],
+                spk_id: 7,
+                opk_id: Some(9),
+            }),
+        ] {
+            let env = Envelope {
+                prekey,
+                ..sample_envelope()
+            };
+            let wire = EnvelopeB64::from(&env);
+            let json = serde_json::to_string(&wire).unwrap();
+            let back: EnvelopeB64 = serde_json::from_str(&json).unwrap();
+            assert_eq!(Envelope::try_from(back).unwrap(), env);
+        }
     }
 
     #[test]
@@ -481,10 +687,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_envelope_without_signature_is_rejected() {
-        // Конверт из старой версии: нет `v` и `sig_b64`.
-        let json = r#"{"from":"a","to":"b","eph_pub_b64":"AA","nonce_b64":"AA","body_b64":"AA"}"#;
-        assert!(serde_json::from_str::<EnvelopeB64>(json).is_err());
+    fn older_envelopes_are_rejected() {
+        // v0: без версии и подписи.
+        let v0 = r#"{"from":"a","to":"b","eph_pub_b64":"AA","nonce_b64":"AA","body_b64":"AA"}"#;
+        assert!(serde_json::from_str::<EnvelopeB64>(v0).is_err());
+        // v1: без ratchet-заголовка.
+        let v1 = r#"{"v":1,"from":"a","to":"b","eph_pub_b64":"AA","nonce_b64":"AA","body_b64":"AA","sig_b64":"AA"}"#;
+        assert!(serde_json::from_str::<EnvelopeB64>(v1).is_err());
     }
 
     #[test]
@@ -498,22 +707,80 @@ mod tests {
         e.to = "carol".into();
         variants.push(e);
         let mut e = base.clone();
-        e.eph_pub[0] ^= 1;
+        e.prekey = None;
         variants.push(e);
         let mut e = base.clone();
-        e.nonce[0] ^= 1;
+        e.prekey.as_mut().unwrap().ek_pub[0] ^= 1;
+        variants.push(e);
+        let mut e = base.clone();
+        e.prekey.as_mut().unwrap().spk_id += 1;
+        variants.push(e);
+        let mut e = base.clone();
+        e.prekey.as_mut().unwrap().opk_id = None;
+        variants.push(e);
+        let mut e = base.clone();
+        e.header.dh_pub[0] ^= 1;
+        variants.push(e);
+        let mut e = base.clone();
+        e.header.pn += 1;
+        variants.push(e);
+        let mut e = base.clone();
+        e.header.n += 1;
         variants.push(e);
         let mut e = base.clone();
         e.body.push(0);
         variants.push(e);
 
-        for v in variants {
+        for v in &variants {
             assert_ne!(v.signing_bytes(), base.signing_bytes());
         }
+        // Шифротекст не входит в заголовок, всё остальное — входит.
+        for v in &variants[..variants.len() - 1] {
+            assert_ne!(v.header_bytes(), base.header_bytes());
+        }
         // Длины в префиксе не дают «перетечь» байтам из from в to.
+        let h = RatchetHeader {
+            dh_pub: [0; 32],
+            pn: 0,
+            n: 0,
+        };
         assert_ne!(
-            envelope_aad("ab", "c", &[0; 32]),
-            envelope_aad("a", "bc", &[0; 32])
+            envelope_header_bytes("ab", "c", None, &h),
+            envelope_header_bytes("a", "bc", None, &h)
+        );
+    }
+
+    #[test]
+    fn prekeys_roundtrip_and_card_stays_compatible() {
+        let spk = SignedPrekey {
+            id: 3,
+            public: [1; 32],
+            sig: [2; 64],
+        };
+        assert_eq!(
+            SignedPrekey::try_from(&SignedPrekeyB64::from(&spk)).unwrap(),
+            spk
+        );
+        let opk = OneTimePrekey {
+            id: 4,
+            public: [3; 32],
+        };
+        assert_eq!(
+            OneTimePrekey::try_from(&OneTimePrekeyB64::from(&opk)).unwrap(),
+            opk
+        );
+        assert_ne!(
+            SignedPrekey::signing_bytes(1, &[0; 32]),
+            SignedPrekey::signing_bytes(2, &[0; 32])
+        );
+
+        // Карточка без предключа (из прошлой версии) по-прежнему читается.
+        let old = r#"{"account_id":"a","username":null,"x25519_pub_b64":"AA","ed25519_pub_b64":"AA","sig_b64":"AA"}"#;
+        assert_eq!(
+            serde_json::from_str::<ContactCardV2>(old)
+                .unwrap()
+                .signed_prekey,
+            None
         );
     }
 

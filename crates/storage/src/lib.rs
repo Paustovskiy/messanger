@@ -3,7 +3,13 @@
 //! Что хранится:
 //! * `identities` — своя личность (одна на базу) вместе с **секретными ключами**;
 //! * `contacts`   — проверенные карточки собеседников;
-//! * `messages`   — история переписки и исходящая очередь.
+//! * `messages`   — история переписки и исходящая очередь;
+//! * `sessions`, `signed_prekeys`, `one_time_prekeys`, `used_prekey_eks` —
+//!   состояние Double Ratchet и предключи X3DH (тоже **секретные**).
+//!
+//! Операции, которые читают и меняют состояние сессии, выполняются внутри
+//! [`Db::immediate`] — так два процесса (`listen` и `send`) не затрут друг другу
+//! состояние храповика.
 //!
 //! Схема версионируется через `PRAGMA user_version`; [`Db::open`] сам доводит
 //! любую старую базу до текущей версии.
@@ -16,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Текущая версия схемы.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct Db {
     conn: Connection,
@@ -45,6 +51,34 @@ pub struct ContactRow {
     /// Ed25519 public. `None` — контакт добавлен старой версией, его сообщения
     /// проверить нельзя, нужно заново импортировать карточку.
     pub sign_public: Option<[u8; 32]>,
+    /// Подписанный предключ из карточки — для переписки без релея.
+    pub signed_prekey: Option<StoredPrekey>,
+}
+
+/// Публичный предключ с подписью (как его прислал собеседник).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredPrekey {
+    pub id: u32,
+    pub public: [u8; 32],
+    pub sig: [u8; 64],
+}
+
+/// Наш подписанный предключ вместе с секретом.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnSignedPrekey {
+    pub id: u32,
+    pub secret: [u8; 32],
+    pub public: [u8; 32],
+    pub sig: [u8; 64],
+    pub created_at: i64,
+}
+
+/// Наш одноразовый предключ вместе с секретом.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnOneTimePrekey {
+    pub id: u32,
+    pub secret: [u8; 32],
+    pub public: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,14 +111,16 @@ pub enum DeliveryStatus {
     Pending,
     /// Получатель подтвердил, что сохранил сообщение (✓✓).
     Delivered,
+    /// Отправить невозможно (например, сохранено старой версией в устаревшем формате).
+    Failed,
 }
 
 impl DeliveryStatus {
     fn from_db(v: i64) -> Self {
-        if v >= 1 {
-            Self::Delivered
-        } else {
-            Self::Pending
+        match v {
+            0 => Self::Pending,
+            2 => Self::Failed,
+            _ => Self::Delivered,
         }
     }
 }
@@ -168,6 +204,9 @@ impl Db {
     }
 
     fn init(mut conn: Connection) -> Result<Self> {
+        // Другой процесс с той же базой (например, `listen`) может держать запись —
+        // подождём, а не упадём. Ставим до всего остального, включая смену журнала.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
@@ -175,6 +214,23 @@ impl Db {
         )?;
         migrate(&mut conn)?;
         Ok(Self { conn })
+    }
+
+    /// Выполнить `f` в эксклюзивной транзакции (`BEGIN IMMEDIATE`): всё, что
+    /// `f` делает с базой, применяется целиком или не применяется вовсе, а другие
+    /// процессы ждут. Вложенные вызовы не поддерживаются.
+    pub fn immediate<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f() {
+            Ok(v) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     // ----- личность -------------------------------------------------------
@@ -262,18 +318,25 @@ impl Db {
             }
         }
 
+        let spk = c.signed_prekey.as_ref();
         self.conn.execute(
-            "INSERT INTO contacts (account_id, username, public, sign_public, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO contacts (account_id, username, public, sign_public, spk_id, spk_pub, spk_sig, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(account_id) DO UPDATE SET
                  username    = excluded.username,
                  public      = excluded.public,
-                 sign_public = excluded.sign_public",
+                 sign_public = excluded.sign_public,
+                 spk_id      = COALESCE(excluded.spk_id, contacts.spk_id),
+                 spk_pub     = COALESCE(excluded.spk_pub, contacts.spk_pub),
+                 spk_sig     = COALESCE(excluded.spk_sig, contacts.spk_sig)",
             params![
                 c.account_id,
                 c.username,
                 &c.public[..],
                 c.sign_public.as_ref().map(|k| &k[..]),
+                spk.map(|k| k.id),
+                spk.map(|k| &k.public[..]),
+                spk.map(|k| &k.sig[..]),
                 unix_now()
             ],
         )?;
@@ -290,7 +353,7 @@ impl Db {
 
     pub fn list_contacts(&self) -> Result<Vec<ContactRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT account_id, username, public, sign_public FROM contacts
+            "SELECT account_id, username, public, sign_public, spk_id, spk_pub, spk_sig FROM contacts
              ORDER BY COALESCE(username, account_id) ASC",
         )?;
         let rows = stmt.query_map([], contact_from_row)?;
@@ -302,7 +365,7 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT account_id, username, public, sign_public FROM contacts WHERE account_id = ?1",
+                "SELECT account_id, username, public, sign_public, spk_id, spk_pub, spk_sig FROM contacts WHERE account_id = ?1",
                 params![account_id],
                 contact_from_row,
             )
@@ -320,7 +383,7 @@ impl Db {
 
         let uname = format!("@{}", key.trim_start_matches('@'));
         let mut stmt = self.conn.prepare(
-            "SELECT account_id, username, public, sign_public FROM contacts
+            "SELECT account_id, username, public, sign_public, spk_id, spk_pub, spk_sig FROM contacts
              WHERE LOWER(username) = LOWER(?1)",
         )?;
         let mut found: Vec<ContactRow> = stmt
@@ -463,6 +526,189 @@ impl Db {
             .optional()?)
     }
 
+    /// Пометить исходящее сообщение как неотправляемое.
+    pub fn mark_out_failed(&self, peer_account_id: &str, msg_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET status = 2
+             WHERE direction = 1 AND peer_account_id = ?1 AND msg_id = ?2 AND status = 0",
+            params![peer_account_id, msg_id],
+        )?;
+        Ok(())
+    }
+
+    /// Есть ли уже входящее сообщение с таким `msg_id` от этого собеседника.
+    pub fn has_incoming(&self, peer_account_id: &str, msg_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM messages WHERE direction = 0 AND peer_account_id = ?1 AND msg_id = ?2",
+            )?
+            .exists(params![peer_account_id, msg_id])?)
+    }
+
+    // ----- сессии ---------------------------------------------------------
+
+    /// Состояние сессий с собеседником (непрозрачный JSON из `crypto_core`).
+    pub fn load_sessions(&self, peer_account_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT state FROM sessions WHERE peer_account_id = ?1",
+                params![peer_account_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn save_sessions(&self, peer_account_id: &str, state: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sessions (peer_account_id, state, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(peer_account_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+            params![peer_account_id, state, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    /// Забыть сессии с собеседником (например, при удалении контакта).
+    pub fn delete_sessions(&self, peer_account_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sessions WHERE peer_account_id = ?1",
+            params![peer_account_id],
+        )?;
+        Ok(())
+    }
+
+    /// Встречался ли уже этот одноразовый ключ X3DH от собеседника.
+    pub fn is_ek_used(&self, peer_account_id: &str, ek: &[u8; 32]) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT 1 FROM used_prekey_eks WHERE peer_account_id = ?1 AND ek = ?2")?
+            .exists(params![peer_account_id, &ek[..]])?)
+    }
+
+    pub fn mark_ek_used(&self, peer_account_id: &str, ek: &[u8; 32]) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO used_prekey_eks (peer_account_id, ek, used_at) VALUES (?1, ?2, ?3)",
+            params![peer_account_id, &ek[..], unix_now()],
+        )?;
+        Ok(())
+    }
+
+    // ----- наши предключи -------------------------------------------------
+
+    /// Следующий свободный ID для подписанного предключа.
+    pub fn next_signed_prekey_id(&self) -> Result<u32> {
+        let max: Option<u32> =
+            self.conn
+                .query_row("SELECT MAX(id) FROM signed_prekeys", [], |r| r.get(0))?;
+        Ok(max.map_or(1, |m| m + 1))
+    }
+
+    pub fn insert_signed_prekey(&self, k: &OwnSignedPrekey) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO signed_prekeys (id, secret, public, sig, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![k.id, &k.secret[..], &k.public[..], &k.sig[..], k.created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Самый свежий подписанный предключ.
+    pub fn current_signed_prekey(&self) -> Result<Option<OwnSignedPrekey>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, secret, public, sig, created_at FROM signed_prekeys ORDER BY id DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok(OwnSignedPrekey {
+                        id: r.get(0)?,
+                        secret: blob32(r, 1)?,
+                        public: blob32(r, 2)?,
+                        sig: blob64(r, 3)?,
+                        created_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn signed_prekey_secret(&self, id: u32) -> Result<Option<[u8; 32]>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT secret FROM signed_prekeys WHERE id = ?1",
+                params![id],
+                |r| blob32(r, 0),
+            )
+            .optional()?)
+    }
+
+    /// Удалить подписанные предключи старше `before` (unix-время), кроме самого свежего.
+    pub fn prune_signed_prekeys(&self, before: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM signed_prekeys
+             WHERE created_at < ?1 AND id <> (SELECT MAX(id) FROM signed_prekeys)",
+            params![before],
+        )?)
+    }
+
+    /// Следующий свободный ID для одноразового предключа.
+    pub fn next_one_time_prekey_id(&self) -> Result<u32> {
+        // ID не переиспользуются, даже если ключ уже удалён: храним счётчик.
+        let v: Option<u32> = self
+            .conn
+            .query_row(
+                "SELECT value FROM counters WHERE name = 'one_time_prekey'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.unwrap_or(0) + 1)
+    }
+
+    pub fn insert_one_time_prekeys(&self, keys: &[OwnOneTimePrekey]) -> Result<()> {
+        let now = unix_now();
+        let mut max = None;
+        for k in keys {
+            self.conn.execute(
+                "INSERT INTO one_time_prekeys (id, secret, public, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![k.id, &k.secret[..], &k.public[..], now],
+            )?;
+            max = max.max(Some(k.id));
+        }
+        if let Some(max) = max {
+            self.conn.execute(
+                "INSERT INTO counters (name, value) VALUES ('one_time_prekey', ?1)
+                 ON CONFLICT(name) DO UPDATE SET value = MAX(value, excluded.value)",
+                params![max],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn one_time_prekey_secret(&self, id: u32) -> Result<Option<[u8; 32]>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT secret FROM one_time_prekeys WHERE id = ?1",
+                params![id],
+                |r| blob32(r, 0),
+            )
+            .optional()?)
+    }
+
+    pub fn delete_one_time_prekey(&self, id: u32) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM one_time_prekeys WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn count_one_time_prekeys(&self) -> Result<u32> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(1) FROM one_time_prekeys", [], |r| r.get(0))?)
+    }
+
     /// Исходящие сообщения, которые получатель ещё не подтвердил.
     pub fn list_pending_outgoing(&self, limit: usize) -> Result<Vec<PendingOutgoing>> {
         let mut stmt = self.conn.prepare(
@@ -518,9 +764,41 @@ const SCHEMA_V3: &str = "
         is_read         INTEGER NOT NULL DEFAULT 1,
         msg_id          TEXT NULL,
         delivered_at    INTEGER NULL,
-        status          INTEGER NOT NULL DEFAULT 0 -- 0 = ждёт, 1 = доставлено
+        status          INTEGER NOT NULL DEFAULT 0 -- 0 = ждёт, 1 = доставлено, 2 = не отправить
     );
     CREATE INDEX IF NOT EXISTS idx_messages_peer_time ON messages(peer_account_id, created_at);
+";
+
+/// v4: прямая секретность (X3DH + Double Ratchet).
+const SCHEMA_V4: &str = "
+    CREATE TABLE IF NOT EXISTS sessions (
+        peer_account_id TEXT PRIMARY KEY,
+        state           TEXT NOT NULL,
+        updated_at      INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS signed_prekeys (
+        id         INTEGER PRIMARY KEY,
+        secret     BLOB NOT NULL,
+        public     BLOB NOT NULL,
+        sig        BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS one_time_prekeys (
+        id         INTEGER PRIMARY KEY,
+        secret     BLOB NOT NULL,
+        public     BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS used_prekey_eks (
+        peer_account_id TEXT NOT NULL,
+        ek              BLOB NOT NULL,
+        used_at         INTEGER NOT NULL,
+        PRIMARY KEY (peer_account_id, ek)
+    );
+    CREATE TABLE IF NOT EXISTS counters (
+        name  TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+    );
 ";
 
 /// Довести базу любой из прошлых версий до [`SCHEMA_VERSION`].
@@ -535,7 +813,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         );
     }
 
-    let tx = conn.transaction()?;
+    // IMMEDIATE: сразу берём блокировку на запись (с ожиданием), иначе при
+    // одновременном открытии базы двумя процессами один получал бы SQLITE_BUSY.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     // Самая первая схема: identities(user_id, …) без username.
     if table_exists(&tx, "identities")?
@@ -552,6 +832,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
 
     tx.execute_batch(SCHEMA_V3)?;
+    tx.execute_batch(SCHEMA_V4)?;
 
     // Колонки, которые появлялись по ходу развития.
     for (table, column, ddl) in [
@@ -589,6 +870,21 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             "messages",
             "delivered_at",
             "ALTER TABLE messages ADD COLUMN delivered_at INTEGER NULL",
+        ),
+        (
+            "contacts",
+            "spk_id",
+            "ALTER TABLE contacts ADD COLUMN spk_id INTEGER NULL",
+        ),
+        (
+            "contacts",
+            "spk_pub",
+            "ALTER TABLE contacts ADD COLUMN spk_pub BLOB NULL",
+        ),
+        (
+            "contacts",
+            "spk_sig",
+            "ALTER TABLE contacts ADD COLUMN spk_sig BLOB NULL",
         ),
     ] {
         if !column_exists(&tx, table, column)? {
@@ -635,11 +931,37 @@ fn get_user_version(conn: &Connection) -> Result<i64> {
 // ---------------------------------------------------------------------------
 
 fn contact_from_row(r: &Row<'_>) -> rusqlite::Result<ContactRow> {
+    let spk_id: Option<u32> = r.get(4)?;
+    let spk_pub = blob32_opt(r, 5)?;
+    let spk_sig: Option<Vec<u8>> = r.get(6)?;
+    let signed_prekey = match (spk_id, spk_pub, spk_sig) {
+        (Some(id), Some(public), Some(sig)) => Some(StoredPrekey {
+            id,
+            public,
+            sig: to64(sig, 6)?,
+        }),
+        _ => None,
+    };
     Ok(ContactRow {
         account_id: r.get(0)?,
         username: r.get(1)?,
         public: blob32(r, 2)?,
         sign_public: blob32_opt(r, 3)?,
+        signed_prekey,
+    })
+}
+
+fn blob64(r: &Row<'_>, idx: usize) -> rusqlite::Result<[u8; 64]> {
+    to64(r.get(idx)?, idx)
+}
+
+fn to64(v: Vec<u8>, idx: usize) -> rusqlite::Result<[u8; 64]> {
+    v.try_into().map_err(|v: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Blob,
+            format!("expected 64 bytes, got {}", v.len()).into(),
+        )
     })
 }
 

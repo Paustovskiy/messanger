@@ -1,6 +1,7 @@
 //! Постоянное хранилище релея: привязки аккаунтов к ключам и очередь доставки.
 
 use anyhow::{Context, Result};
+use protocol::{OneTimePrekey, SignedPrekey};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -68,6 +69,7 @@ impl Store {
             Some(p) => Connection::open(p).with_context(|| format!("open {}", p.display()))?,
             None => Connection::open_in_memory()?,
         };
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -87,7 +89,19 @@ impl Store {
                  UNIQUE (recipient, sender, msg_id, kind)
              );
              CREATE INDEX IF NOT EXISTS idx_queue_recipient ON queue(recipient, id);
-             CREATE INDEX IF NOT EXISTS idx_queue_created ON queue(created_at);",
+             CREATE INDEX IF NOT EXISTS idx_queue_created ON queue(created_at);
+             CREATE TABLE IF NOT EXISTS signed_prekeys (
+                 account_id TEXT PRIMARY KEY,
+                 id         INTEGER NOT NULL,
+                 public     BLOB NOT NULL,
+                 sig        BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS one_time_prekeys (
+                 account_id TEXT NOT NULL,
+                 id         INTEGER NOT NULL,
+                 public     BLOB NOT NULL,
+                 PRIMARY KEY (account_id, id)
+             );",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -189,6 +203,114 @@ impl Store {
             params![recipient, sender, msg_id],
         )?;
         Ok(n > 0)
+    }
+
+    // ----- предключи -------------------------------------------------------
+
+    /// Заменить подписанный предключ и добавить одноразовые (сверх `max_one_time`
+    /// не храним). Возвращает, сколько одноразовых теперь лежит.
+    pub fn publish_prekeys(
+        &self,
+        account_id: &str,
+        signed: &SignedPrekey,
+        one_time: &[OneTimePrekey],
+        max_one_time: usize,
+    ) -> Result<u32> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO signed_prekeys (account_id, id, public, sig) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id) DO UPDATE SET id = excluded.id, public = excluded.public, sig = excluded.sig",
+            params![account_id, signed.id, &signed.public[..], &signed.sig[..]],
+        )?;
+        let mut count: u32 = tx.query_row(
+            "SELECT COUNT(1) FROM one_time_prekeys WHERE account_id = ?1",
+            params![account_id],
+            |r| r.get(0),
+        )?;
+        for k in one_time {
+            if count as usize >= max_one_time {
+                break;
+            }
+            count += tx.execute(
+                "INSERT OR IGNORE INTO one_time_prekeys (account_id, id, public) VALUES (?1, ?2, ?3)",
+                params![account_id, k.id, &k.public[..]],
+            )? as u32;
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Есть ли подписанный предключ и сколько одноразовых осталось.
+    pub fn prekey_status(&self, account_id: &str) -> Result<(bool, u32)> {
+        let conn = self.conn();
+        let has_signed = conn
+            .prepare_cached("SELECT 1 FROM signed_prekeys WHERE account_id = ?1")?
+            .exists(params![account_id])?;
+        let count = conn.query_row(
+            "SELECT COUNT(1) FROM one_time_prekeys WHERE account_id = ?1",
+            params![account_id],
+            |r| r.get(0),
+        )?;
+        Ok((has_signed, count))
+    }
+
+    /// Набор предключей для новой сессии. Одноразовый ключ выдаётся один раз.
+    pub fn take_bundle(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<(SignedPrekey, Option<OneTimePrekey>)>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let signed = tx
+            .query_row(
+                "SELECT id, public, sig FROM signed_prekeys WHERE account_id = ?1",
+                params![account_id],
+                |r| {
+                    Ok((
+                        r.get::<_, u32>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, public, sig)) = signed else {
+            return Ok(None);
+        };
+        let signed = SignedPrekey {
+            id,
+            public: public
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("corrupt prekey"))?,
+            sig: sig
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("corrupt prekey"))?,
+        };
+        let one_time = tx
+            .query_row(
+                "SELECT id, public FROM one_time_prekeys WHERE account_id = ?1 ORDER BY id LIMIT 1",
+                params![account_id],
+                |r| Ok((r.get::<_, u32>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let one_time = match one_time {
+            None => None,
+            Some((id, public)) => {
+                tx.execute(
+                    "DELETE FROM one_time_prekeys WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, id],
+                )?;
+                Some(OneTimePrekey {
+                    id,
+                    public: public
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("corrupt prekey"))?,
+                })
+            }
+        };
+        tx.commit()?;
+        Ok(Some((signed, one_time)))
     }
 
     /// Выбросить всё, что пролежало в очереди дольше `ttl_secs`.
