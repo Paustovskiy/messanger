@@ -361,6 +361,7 @@ name = "cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "crypto_core",
@@ -369,6 +370,7 @@ dependencies = [
  "relay_server",
  "rpassword",
  "rustls",
+ "serde",
  "serde_json",
  "storage",
  "tokio",

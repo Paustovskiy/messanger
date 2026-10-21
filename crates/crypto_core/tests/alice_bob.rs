@@ -15,12 +15,21 @@ struct Party {
     spk_public: SignedPrekey,
     opks: HashMap<u32, ([u8; 32], protocol::OneTimePrekey)>,
     used_eks: HashSet<[u8; 32]>,
+    /// Сессии по (аккаунт, устройство) собеседника.
     sessions: HashMap<String, SessionSet>,
+}
+
+/// Ключ сессии в тестах: «аккаунт/устройство».
+fn sk(p: &Party) -> String {
+    format!("{}/{}", p.id.account_id(), p.id.device_id())
 }
 
 impl Party {
     fn new(name: &str) -> Self {
-        let id = Identity::generate(name);
+        Self::with_identity(Identity::generate(name))
+    }
+
+    fn with_identity(id: Identity) -> Self {
         let (secret, spk) = id.new_signed_prekey(1);
         let opks = (100..105).map(|i| (i, new_one_time_prekey(i))).collect();
         Self {
@@ -37,6 +46,7 @@ impl Party {
     fn keys(&self) -> PeerKeys {
         PeerKeys {
             account_id: self.id.account_id().into(),
+            device_id: self.id.device_id(),
             x25519_pub: self.id.x_public_bytes(),
             ed25519_pub: self.id.sign_public_bytes(),
         }
@@ -65,18 +75,12 @@ impl Party {
 
     fn start(&mut self, peer: &mut Party, with_opk: bool) {
         let bundle = peer.bundle(with_opk);
-        let set = self
-            .sessions
-            .entry(peer.id.account_id().into())
-            .or_default();
+        let set = self.sessions.entry(sk(peer)).or_default();
         self.id.start_session(&peer.keys(), &bundle, set).unwrap();
     }
 
     fn send(&mut self, to: &Party, text: &str) -> Envelope {
-        let set = self
-            .sessions
-            .get_mut(to.id.account_id())
-            .expect("no session");
+        let set = self.sessions.get_mut(&sk(to)).expect("no session");
         let env = self.id.seal(&to.keys(), set, text.as_bytes()).unwrap();
         // По сети конверт идёт как JSON.
         let json = serde_json::to_string(&EnvelopeB64::from(&env)).unwrap();
@@ -93,11 +97,7 @@ impl Party {
             },
         };
         // Как в приложении: работаем с копией и сохраняем только при успехе.
-        let mut set = self
-            .sessions
-            .get(from.id.account_id())
-            .cloned()
-            .unwrap_or_default();
+        let mut set = self.sessions.get(&sk(from)).cloned().unwrap_or_default();
         let opened = self.id.open(&from.keys(), &mut set, env, &secrets)?;
         if let Some(ek) = opened.new_session_ek {
             self.used_eks.insert(ek);
@@ -107,7 +107,7 @@ impl Party {
         }
         // Сохраняем через JSON — ровно как в базе.
         let set = SessionSet::from_json(&set.to_json()).unwrap();
-        self.sessions.insert(from.id.account_id().into(), set);
+        self.sessions.insert(sk(from), set);
         Ok(String::from_utf8(opened.plaintext).unwrap())
     }
 }
@@ -170,7 +170,7 @@ fn several_messages_before_reply_arrive_out_of_order() {
     assert_eq!(bob.recv(&alice, &msgs[3]).unwrap(), "3");
     assert_eq!(bob.recv(&alice, &msgs[1]).unwrap(), "1");
     assert_eq!(
-        bob.sessions["alice"].len(),
+        bob.sessions["alice/1"].len(),
         1,
         "all four belong to one session"
     );
@@ -195,7 +195,7 @@ fn reused_one_time_prekey_is_rejected() {
     let mut carol = Party::new("carol");
     let bundle = bob.bundle(true);
     for p in [&mut alice, &mut carol] {
-        let set = p.sessions.entry("bob".into()).or_default();
+        let set = p.sessions.entry("bob/1".into()).or_default();
         p.id.start_session(&bob.keys(), &bundle, set).unwrap();
     }
     let from_alice = alice.send(&bob, "a");
@@ -322,7 +322,7 @@ fn forged_and_misdirected_envelopes_are_rejected() {
     // Чужой получатель.
     assert_eq!(
         carol.recv(&alice, &m),
-        Err(CryptoError::WrongRecipient("bob".into()))
+        Err(CryptoError::WrongRecipient("bob/1".into()))
     );
 
     // Изменённый шифротекст или заголовок — подпись не сходится.
@@ -357,7 +357,7 @@ fn no_session_and_limits() {
 
     let mut bob = bob;
     alice.start(&mut bob, true);
-    let set = alice.sessions.get_mut("bob").unwrap();
+    let set = alice.sessions.get_mut("bob/1").unwrap();
     let big = vec![0u8; MAX_PLAINTEXT_LEN + 1];
     assert_eq!(
         alice.id.seal(&bob.keys(), set, &big).unwrap_err(),
@@ -378,7 +378,7 @@ fn session_count_is_bounded() {
         alice.start(&mut bob, false);
     }
     assert_eq!(
-        alice.sessions["bob"].len(),
+        alice.sessions["bob/1"].len(),
         crypto_core::session::MAX_SESSIONS
     );
 }
@@ -478,4 +478,178 @@ fn fingerprint_format() {
         fp.split(' ')
             .all(|g| g.len() == 4 && g.chars().all(|c| c.is_ascii_hexdigit()))
     );
+}
+
+// ---------- Несколько устройств ----------
+
+/// Второе устройство того же аккаунта: свои ключи, общий account_id.
+fn second_device(primary: &Identity, device_id: u32) -> Identity {
+    Identity::generate(primary.account_id()).with_device(device_id)
+}
+
+fn device_list(primary: &Identity, others: &[&Identity], version: u64) -> protocol::DeviceList {
+    let mut devices = vec![primary.device_info("ноутбук")];
+    devices.extend(
+        others
+            .iter()
+            .map(|d| d.device_info(format!("устройство {}", d.device_id()))),
+    );
+    protocol::DeviceList {
+        account_id: primary.account_id().into(),
+        account_pub: primary.sign_public_bytes(),
+        version,
+        devices,
+    }
+}
+
+#[test]
+fn each_device_has_its_own_session() {
+    let mut alice = Party::new("alice");
+    let mut bob1 = Party::new("bob");
+    let mut bob2 = Party::with_identity(second_device(&bob1.id, 2));
+
+    alice.start(&mut bob1, true);
+    alice.start(&mut bob2, true);
+    let to1 = alice.send(&bob1, "для ноутбука");
+    let to2 = alice.send(&bob2, "для телефона");
+    assert_eq!((to1.to_device, to2.to_device), (1, 2));
+
+    // Конверт для одного устройства другое открыть не может.
+    assert_eq!(
+        bob1.recv(&alice, &to2),
+        Err(CryptoError::WrongRecipient("bob/2".into()))
+    );
+    assert_eq!(bob1.recv(&alice, &to1).unwrap(), "для ноутбука");
+    assert_eq!(bob2.recv(&alice, &to2).unwrap(), "для телефона");
+
+    // Оба устройства отвечают, Алиса различает их по номеру.
+    let r2 = bob2.send(&alice, "с телефона");
+    assert_eq!(r2.from_device, 2);
+    assert_eq!(alice.recv(&bob2, &r2).unwrap(), "с телефона");
+    // Подменить номер устройства отправителя нельзя: он под подписью.
+    let r1 = bob1.send(&alice, "с ноутбука");
+    let mut spoofed = r1.clone();
+    spoofed.from_device = 2;
+    assert_eq!(alice.recv(&bob2, &spoofed), Err(CryptoError::BadSignature));
+    assert_eq!(alice.recv(&bob1, &r1).unwrap(), "с ноутбука");
+}
+
+#[test]
+fn devices_of_one_account_talk_to_each_other() {
+    // Расшифровки «я отправил» на свои же устройства — обычные сессии внутри аккаунта.
+    let mut one = Party::new("me");
+    let mut two = Party::with_identity(second_device(&one.id, 2));
+    one.start(&mut two, true);
+    let m = one.send(&two, "копия");
+    assert_eq!(two.recv(&one, &m).unwrap(), "копия");
+    let r = two.send(&one, "ок");
+    assert_eq!(one.recv(&two, &r).unwrap(), "ок");
+}
+
+#[test]
+fn simultaneous_start_between_devices_of_one_account() {
+    for first in [true, false] {
+        let mut one = Party::new("me");
+        let mut two = Party::with_identity(second_device(&one.id, 2));
+        one.start(&mut two, true);
+        two.start(&mut one, true);
+        let a = one.send(&two, "a");
+        let b = two.send(&one, "b");
+        if first {
+            assert_eq!(one.recv(&two, &b).unwrap(), "b");
+            assert_eq!(two.recv(&one, &a).unwrap(), "a");
+        } else {
+            assert_eq!(two.recv(&one, &a).unwrap(), "a");
+            assert_eq!(one.recv(&two, &b).unwrap(), "b");
+        }
+        for i in 0..3 {
+            let m = one.send(&two, &i.to_string());
+            assert_eq!(two.recv(&one, &m).unwrap(), i.to_string());
+            let m = two.send(&one, &i.to_string());
+            assert_eq!(one.recv(&two, &m).unwrap(), i.to_string());
+        }
+        assert!(one.send(&two, "x").prekey.is_none());
+        assert!(two.send(&one, "y").prekey.is_none());
+    }
+}
+
+#[test]
+fn device_list_signs_and_verifies() {
+    let primary = Identity::generate_new();
+    let phone = second_device(&primary, 2);
+    let list = device_list(&primary, &[&phone], 2);
+    let signed = primary.sign_device_list(&list).unwrap();
+
+    // По JSON, как по сети.
+    let wire: protocol::SignedDeviceListB64 =
+        serde_json::from_str(&serde_json::to_string(&signed).unwrap()).unwrap();
+    // Без известного ключа — проверка по ID, выведенному из ключа аккаунта.
+    let got = crypto_core::verify_device_list(&wire, primary.account_id(), None).unwrap();
+    assert_eq!(got, list);
+    assert_eq!(got.device(2).unwrap().x25519_pub, phone.x_public_bytes());
+    // С известным ключом — тоже.
+    let pk = primary.sign_public_bytes();
+    assert!(crypto_core::verify_device_list(&wire, primary.account_id(), Some(&pk)).is_ok());
+}
+
+#[test]
+fn forged_device_lists_are_rejected() {
+    let primary = Identity::generate_new();
+    let phone = second_device(&primary, 2);
+    let mallory = Identity::generate_new();
+    let list = device_list(&primary, &[&phone], 2);
+    let signed = primary.sign_device_list(&list).unwrap();
+
+    // Подставить своё устройство в чужой список — подпись не сходится.
+    let mut forged = list.clone();
+    forged.devices[1].x25519_pub = mallory.x_public_bytes();
+    let forged = protocol::SignedDeviceListB64::from_parts(&forged, signed.parts().unwrap().1);
+    assert_eq!(
+        crypto_core::verify_device_list(&forged, primary.account_id(), None),
+        Err(CryptoError::BadSignature)
+    );
+
+    // Мэллори подписала список своим ключом от имени чужого аккаунта.
+    let mut fake = device_list(&primary, &[], 3);
+    fake.account_pub = mallory.sign_public_bytes();
+    fake.devices[0].ed25519_pub = mallory.sign_public_bytes();
+    let sig = mallory.sign(&fake.signing_bytes());
+    let fake = protocol::SignedDeviceListB64::from_parts(&fake, sig);
+    assert_eq!(
+        crypto_core::verify_device_list(&fake, primary.account_id(), None),
+        Err(CryptoError::AccountIdMismatch)
+    );
+    let pk = primary.sign_public_bytes();
+    assert_eq!(
+        crypto_core::verify_device_list(&fake, primary.account_id(), Some(&pk)),
+        Err(CryptoError::AccountIdMismatch)
+    );
+
+    // Список другого аккаунта под чужим ID.
+    assert_eq!(
+        crypto_core::verify_device_list(&signed, mallory.account_id(), None),
+        Err(CryptoError::AccountIdMismatch)
+    );
+
+    // Подписать список может только основное устройство.
+    let phone_list = device_list(&primary, &[&phone], 3);
+    assert_eq!(
+        phone.sign_device_list(&phone_list),
+        Err(CryptoError::NotAccountKey)
+    );
+}
+
+#[test]
+fn legacy_account_lists_need_a_known_key() {
+    // У старых UUID-аккаунтов ID не выведен из ключа: без ключа из карточки — не доверяем.
+    let legacy = Identity::generate("2d723969-b478-4ff4-af0a-477541df0441");
+    let signed = legacy
+        .sign_device_list(&device_list(&legacy, &[], 1))
+        .unwrap();
+    assert_eq!(
+        crypto_core::verify_device_list(&signed, legacy.account_id(), None),
+        Err(CryptoError::AccountIdMismatch)
+    );
+    let pk = legacy.sign_public_bytes();
+    assert!(crypto_core::verify_device_list(&signed, legacy.account_id(), Some(&pk)).is_ok());
 }

@@ -11,6 +11,7 @@ fn tmp_path(name: &str) -> std::path::PathBuf {
 fn identity_row(id: &Identity) -> IdentityRow {
     IdentityRow {
         account_id: id.account_id().to_string(),
+        device_id: id.device_id(),
         username: None,
         secret: id.x_secret_bytes(),
         public: id.x_public_bytes(),
@@ -186,7 +187,6 @@ fn threads_unread_and_delivery_status() {
     db.mark_thread_read("bob").unwrap();
     assert_eq!(db.list_threads(10).unwrap()[0].unread_count, 0);
 
-    assert_eq!(db.list_pending_outgoing(10).unwrap().len(), 1);
     assert!(db.mark_out_delivered("bob", "c").unwrap());
     assert!(
         !db.mark_out_delivered("bob", "c").unwrap(),
@@ -196,7 +196,6 @@ fn threads_unread_and_delivery_status() {
         !db.mark_out_delivered("mallory", "c").unwrap(),
         "ack from wrong peer is ignored"
     );
-    assert!(db.list_pending_outgoing(10).unwrap().is_empty());
     assert_eq!(
         db.list_threads(10).unwrap()[0].last_status,
         DeliveryStatus::Delivered
@@ -280,7 +279,7 @@ fn migrates_database_from_previous_version() {
         .unwrap();
     assert_eq!(v, SCHEMA_VERSION);
     // v4: таблицы сессий появились и пусты.
-    assert!(db.load_sessions("bob").unwrap().is_none());
+    assert!(db.load_sessions("bob", 1).unwrap().is_none());
 }
 
 /// Самая первая схема с `user_id` вместо `account_id` и без ключа подписи.
@@ -372,21 +371,21 @@ fn contact_keeps_signed_prekey_until_a_newer_one_arrives() {
 #[test]
 fn sessions_and_replay_markers() {
     let db = Db::open_in_memory().unwrap();
-    assert!(db.load_sessions("bob").unwrap().is_none());
-    db.save_sessions("bob", "{\"v\":1}").unwrap();
-    db.save_sessions("bob", "{\"v\":2}").unwrap();
+    assert!(db.load_sessions("bob", 1).unwrap().is_none());
+    db.save_sessions("bob", 1, "{\"v\":1}").unwrap();
+    db.save_sessions("bob", 1, "{\"v\":2}").unwrap();
     assert_eq!(
-        db.load_sessions("bob").unwrap().as_deref(),
+        db.load_sessions("bob", 1).unwrap().as_deref(),
         Some("{\"v\":2}")
     );
     db.delete_sessions("bob").unwrap();
-    assert!(db.load_sessions("bob").unwrap().is_none());
+    assert!(db.load_sessions("bob", 1).unwrap().is_none());
 
-    assert!(!db.is_ek_used("bob", &[1; 32]).unwrap());
-    db.mark_ek_used("bob", &[1; 32]).unwrap();
-    db.mark_ek_used("bob", &[1; 32]).unwrap();
-    assert!(db.is_ek_used("bob", &[1; 32]).unwrap());
-    assert!(!db.is_ek_used("carol", &[1; 32]).unwrap());
+    assert!(!db.is_ek_used("bob", 1, &[1; 32]).unwrap());
+    db.mark_ek_used("bob", 1, &[1; 32]).unwrap();
+    db.mark_ek_used("bob", 1, &[1; 32]).unwrap();
+    assert!(db.is_ek_used("bob", 1, &[1; 32]).unwrap());
+    assert!(!db.is_ek_used("carol", 1, &[1; 32]).unwrap());
 
     db.insert_message(&msg(Direction::In, "bob", "x", "m1"))
         .unwrap();
@@ -436,30 +435,227 @@ fn own_prekeys() {
 }
 
 #[test]
-fn failed_messages_leave_the_outbox() {
+fn failed_messages_are_marked() {
     let db = Db::open_in_memory().unwrap();
     db.insert_message(&msg(Direction::Out, "bob", "old format", "m1"))
         .unwrap();
     db.mark_out_failed("bob", "m1").unwrap();
-    assert!(db.list_pending_outgoing(10).unwrap().is_empty());
     assert_eq!(
         db.list_messages_for_peer("bob", 10).unwrap()[0].status,
         DeliveryStatus::Failed
     );
 }
 
+fn out(message: &str, peer: &str, to: &str, device: u32, env: &str) -> OutboxItem {
+    OutboxItem {
+        message_id: message.into(),
+        peer_account_id: peer.into(),
+        to_account_id: to.into(),
+        to_device_id: device,
+        envelope_id: env.into(),
+        envelope_json: format!("{{\"e\":\"{env}\"}}"),
+    }
+}
+
+#[test]
+fn one_message_many_envelopes() {
+    // Боб с двумя устройствами + копия на наше второе устройство.
+    let db = Db::open_in_memory().unwrap();
+    db.insert_message(&msg(Direction::Out, "bob", "привет", "m1"))
+        .unwrap();
+    for item in [
+        out("m1", "bob", "bob", 1, "e1"),
+        out("m1", "bob", "bob", 2, "e2"),
+        out("m1", "bob", "me", 2, "e3"),
+    ] {
+        db.insert_outbox(&item).unwrap();
+        db.insert_outbox(&item).unwrap(); // повтор — не дубль
+    }
+    assert_eq!(db.list_outbox(10).unwrap().len(), 3);
+
+    // Копию подтвердило наше устройство — сообщение ещё не «доставлено».
+    let acked = db.ack_outbox("me", 2, "e3").unwrap().unwrap();
+    assert!(!acked.newly_delivered);
+    assert_eq!(
+        db.list_messages_for_peer("bob", 1).unwrap()[0].status,
+        DeliveryStatus::Pending
+    );
+
+    // Подтверждение с чужого устройства или на чужой конверт ничего не делает.
+    assert!(db.ack_outbox("bob", 1, "e2").unwrap().is_none());
+    assert!(db.ack_outbox("mallory", 2, "e2").unwrap().is_none());
+
+    // Первое устройство Боба — доставлено.
+    let acked = db.ack_outbox("bob", 2, "e2").unwrap().unwrap();
+    assert!(acked.newly_delivered);
+    assert_eq!(acked.message_id, "m1");
+    assert_eq!(
+        db.list_messages_for_peer("bob", 1).unwrap()[0].status,
+        DeliveryStatus::Delivered
+    );
+    // Второе — тоже подтвердило, но «доставлено» уже было.
+    assert!(
+        !db.ack_outbox("bob", 1, "e1")
+            .unwrap()
+            .unwrap()
+            .newly_delivered
+    );
+    assert!(db.list_outbox(10).unwrap().is_empty());
+    // Повторное подтверждение.
+    assert!(db.ack_outbox("bob", 1, "e1").unwrap().is_none());
+}
+
+#[test]
+fn outbox_forgets_removed_devices() {
+    let db = Db::open_in_memory().unwrap();
+    for item in [
+        out("m1", "bob", "bob", 1, "e1"),
+        out("m1", "bob", "bob", 2, "e2"),
+        out("m1", "bob", "bob", 3, "e3"),
+        out("m2", "carol", "carol", 2, "e4"),
+    ] {
+        db.insert_outbox(&item).unwrap();
+    }
+    assert_eq!(db.drop_outbox_except("bob", &[1, 3]).unwrap(), 1);
+    let left: Vec<_> = db
+        .list_outbox(10)
+        .unwrap()
+        .into_iter()
+        .map(|i| i.envelope_id)
+        .collect();
+    assert_eq!(left, ["e1", "e3", "e4"]);
+}
+
+#[test]
+fn sessions_are_per_device() {
+    let db = Db::open_in_memory().unwrap();
+    db.save_sessions("bob", 1, "laptop").unwrap();
+    db.save_sessions("bob", 2, "phone").unwrap();
+    assert_eq!(
+        db.load_sessions("bob", 1).unwrap().as_deref(),
+        Some("laptop")
+    );
+    assert_eq!(
+        db.load_sessions("bob", 2).unwrap().as_deref(),
+        Some("phone")
+    );
+
+    db.delete_device_sessions("bob", 2).unwrap();
+    assert!(db.load_sessions("bob", 2).unwrap().is_none());
+    assert!(db.load_sessions("bob", 1).unwrap().is_some());
+
+    db.mark_ek_used("bob", 2, &[5; 32]).unwrap();
+    assert!(db.is_ek_used("bob", 2, &[5; 32]).unwrap());
+    assert!(!db.is_ek_used("bob", 1, &[5; 32]).unwrap());
+
+    db.mark_envelope_seen("bob", 2, "e1").unwrap();
+    db.mark_envelope_seen("bob", 2, "e1").unwrap();
+    assert!(db.is_envelope_seen("bob", 2, "e1").unwrap());
+    assert!(!db.is_envelope_seen("bob", 1, "e1").unwrap());
+    assert!(!db.is_envelope_seen("carol", 2, "e1").unwrap());
+}
+
+#[test]
+fn device_lists_never_roll_back() {
+    let db = Db::open_in_memory().unwrap();
+    assert!(db.device_list("bob").unwrap().is_none());
+    assert!(db.save_device_list("bob", 2, "v2").unwrap());
+    // Старая версия (например, подсунутая релеем) не заменяет новую.
+    assert!(!db.save_device_list("bob", 1, "v1").unwrap());
+    assert!(!db.save_device_list("bob", 2, "v2 again").unwrap());
+    assert_eq!(db.device_list("bob").unwrap(), Some((2, "v2".into())));
+    assert!(db.save_device_list("bob", 3, "v3").unwrap());
+    assert_eq!(db.device_list("bob").unwrap(), Some((3, "v3".into())));
+
+    // Удаление контакта забывает и его устройства.
+    db.upsert_contact(&contact("bob", None)).unwrap();
+    db.delete_contact("bob").unwrap();
+    assert!(db.device_list("bob").unwrap().is_none());
+}
+
+#[test]
+fn pending_link_roundtrip() {
+    let db = Db::open_in_memory().unwrap();
+    assert!(db.pending_link().unwrap().is_none());
+    let link = PendingLink {
+        x_secret: [1; 32],
+        sign_secret: [2; 32],
+        name: "телефон".into(),
+    };
+    db.set_pending_link(&link).unwrap();
+    db.set_pending_link(&link).unwrap();
+    assert_eq!(db.pending_link().unwrap(), Some(link));
+    db.clear_pending_link().unwrap();
+    assert!(db.pending_link().unwrap().is_none());
+}
+
+/// База v4 (одно устройство): сессии переезжают на устройство №1, а
+/// неотправленное помечается «не отправлено» — формат конверта сменился.
+#[test]
+fn migrates_v4_sessions_to_primary_device() {
+    let path = tmp_path("legacy-v4");
+    let me = Identity::generate("me");
+    {
+        let db = Db::open(&path, None).unwrap();
+        db.upsert_identity(&identity_row(&me)).unwrap();
+        db.insert_message(&msg(Direction::Out, "bob", "застряло", "m1"))
+            .unwrap();
+        db.insert_message(&msg(Direction::Out, "bob", "дошло", "m2"))
+            .unwrap();
+        db.mark_out_delivered("bob", "m2").unwrap();
+    }
+    // Превращаем базу в v4: старые таблицы сессий и без device_id.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE sessions; DROP TABLE used_prekey_eks;
+             CREATE TABLE sessions (peer_account_id TEXT PRIMARY KEY, state TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL);
+             CREATE TABLE used_prekey_eks (peer_account_id TEXT NOT NULL, ek BLOB NOT NULL,
+                 used_at INTEGER NOT NULL, PRIMARY KEY (peer_account_id, ek));
+             INSERT INTO sessions VALUES ('bob', 'ratchet-state', 1);
+             INSERT INTO used_prekey_eks VALUES ('bob', x'0909090909090909090909090909090909090909090909090909090909090909', 1);
+             ALTER TABLE identities DROP COLUMN device_id;
+             DROP TABLE device_lists; DROP TABLE outbox; DROP TABLE seen_envelopes;
+             DROP TABLE pending_link;
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path, None).unwrap();
+    assert_eq!(db.get_local_identity().unwrap().unwrap().device_id, 1);
+    assert_eq!(
+        db.load_sessions("bob", 1).unwrap().as_deref(),
+        Some("ratchet-state")
+    );
+    assert!(db.is_ek_used("bob", 1, &[9; 32]).unwrap());
+    let status: Vec<_> = db
+        .list_messages_for_peer("bob", 10)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.status)
+        .collect();
+    assert_eq!(status, [DeliveryStatus::Failed, DeliveryStatus::Delivered]);
+    assert!(db.list_outbox(10).unwrap().is_empty());
+    drop(db);
+    // Повторное открытие ничего не ломает.
+    let db = Db::open(&path, None).unwrap();
+    assert!(db.load_sessions("bob", 1).unwrap().is_some());
+}
+
 #[test]
 fn immediate_rolls_back_on_error() {
     let db = Db::open_in_memory().unwrap();
     let r: anyhow::Result<()> = db.immediate(|| {
-        db.save_sessions("bob", "half-written")?;
+        db.save_sessions("bob", 1, "half-written")?;
         anyhow::bail!("decryption failed")
     });
     assert!(r.is_err());
-    assert!(db.load_sessions("bob").unwrap().is_none());
+    assert!(db.load_sessions("bob", 1).unwrap().is_none());
 
-    db.immediate(|| db.save_sessions("bob", "ok")).unwrap();
-    assert_eq!(db.load_sessions("bob").unwrap().as_deref(), Some("ok"));
+    db.immediate(|| db.save_sessions("bob", 1, "ok")).unwrap();
+    assert_eq!(db.load_sessions("bob", 1).unwrap().as_deref(), Some("ok"));
 }
 
 /// Два процесса (`listen` и `send`) с одной базой: каждый читает состояние,
@@ -469,7 +665,7 @@ fn concurrent_writers_do_not_lose_updates() {
     let path = tmp_path("concurrent");
     Db::open(&path, None)
         .unwrap()
-        .save_sessions("bob", "0")
+        .save_sessions("bob", 1, "0")
         .unwrap();
 
     let workers: Vec<_> = (0..4)
@@ -479,9 +675,9 @@ fn concurrent_writers_do_not_lose_updates() {
                 let db = Db::open(&path, None).unwrap();
                 for _ in 0..25 {
                     db.immediate(|| {
-                        let n: u32 = db.load_sessions("bob")?.unwrap().parse()?;
+                        let n: u32 = db.load_sessions("bob", 1)?.unwrap().parse()?;
                         std::thread::yield_now();
-                        db.save_sessions("bob", &(n + 1).to_string())
+                        db.save_sessions("bob", 1, &(n + 1).to_string())
                     })
                     .unwrap();
                 }
@@ -494,7 +690,7 @@ fn concurrent_writers_do_not_lose_updates() {
     assert_eq!(
         Db::open(&path, None)
             .unwrap()
-            .load_sessions("bob")
+            .load_sessions("bob", 1)
             .unwrap()
             .as_deref(),
         Some("100")

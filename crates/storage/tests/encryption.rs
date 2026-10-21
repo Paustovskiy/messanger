@@ -102,7 +102,8 @@ fn encrypt_change_and_remove_password_keep_data() {
     {
         let db = Db::open(&path, None).unwrap();
         write_secret(&db);
-        db.save_sessions("bob-account", "{\"ratchet\":1}").unwrap();
+        db.save_sessions("bob-account", 1, "{\"ratchet\":1}")
+            .unwrap();
     }
 
     // Поставить пароль на существующую базу.
@@ -113,7 +114,7 @@ fn encrypt_change_and_remove_password_keep_data() {
         let db = Db::open(&path, Some("первый")).unwrap();
         assert_eq!(read_secret(&db), SECRET);
         assert_eq!(
-            db.load_sessions("bob-account").unwrap().as_deref(),
+            db.load_sessions("bob-account", 1).unwrap().as_deref(),
             Some("{\"ratchet\":1}")
         );
     }
@@ -168,7 +169,7 @@ fn two_processes_share_an_encrypted_database() {
     let path = tmp_path("shared");
     Db::open(&path, Some("pw"))
         .unwrap()
-        .save_sessions("bob", "0")
+        .save_sessions("bob", 1, "0")
         .unwrap();
     let workers: Vec<_> = (0..3)
         .map(|_| {
@@ -177,8 +178,8 @@ fn two_processes_share_an_encrypted_database() {
                 let db = Db::open(&path, Some("pw")).unwrap();
                 for _ in 0..10 {
                     db.immediate(|| {
-                        let n: u32 = db.load_sessions("bob")?.unwrap().parse()?;
-                        db.save_sessions("bob", &(n + 1).to_string())
+                        let n: u32 = db.load_sessions("bob", 1)?.unwrap().parse()?;
+                        db.save_sessions("bob", 1, &(n + 1).to_string())
                     })
                     .unwrap();
                 }
@@ -189,7 +190,7 @@ fn two_processes_share_an_encrypted_database() {
         w.join().unwrap();
     }
     let db = Db::open(&path, Some("pw")).unwrap();
-    assert_eq!(db.load_sessions("bob").unwrap().as_deref(), Some("30"));
+    assert_eq!(db.load_sessions("bob", 1).unwrap().as_deref(), Some("30"));
 }
 
 #[test]
@@ -207,11 +208,11 @@ fn every_database_gets_its_own_salt() {
     let b = tmp_path("salt-b");
     Db::open(&a, Some("same"))
         .unwrap()
-        .save_sessions("x", "1")
+        .save_sessions("x", 1, "1")
         .unwrap();
     Db::open(&b, Some("same"))
         .unwrap()
-        .save_sessions("x", "1")
+        .save_sessions("x", 1, "1")
         .unwrap();
     assert_ne!(
         std::fs::read(&a).unwrap()[..16],
