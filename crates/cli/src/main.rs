@@ -2,6 +2,7 @@
 
 mod display;
 mod messaging;
+mod password;
 mod relay_client;
 mod session;
 
@@ -12,9 +13,9 @@ use messaging::Incoming;
 use protocol::{ContactCardV2, Envelope, EnvelopeB64, normalize_username};
 use session::{Session, Step};
 use std::io::{IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use storage::{ContactRow, Db, DeliveryStatus, Direction, IdentityRow, PendingOutgoing};
+use storage::{ContactRow, Db, DeliveryStatus, Direction, FileState, IdentityRow, PendingOutgoing};
 
 /// Сколько ждать, пока релей примет сообщение.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -53,8 +54,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Создать свою личность (ключи) — один раз.
-    Init,
+    /// Создать свою личность (ключи) — один раз. База шифруется паролем.
+    Init {
+        /// Не шифровать базу паролем (не рекомендуется).
+        #[arg(long)]
+        no_password: bool,
+    },
+
+    /// Зашифровать базу паролем или сменить пароль.
+    SetPassword,
+
+    /// Снять пароль с базы (не рекомендуется).
+    RemovePassword,
 
     /// Показать свой account_id, username и отпечаток ключей.
     Whoami,
@@ -133,19 +144,39 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    // Ошибки — для человека: одной строкой с причинами, без стека вызовов
+    // (его печатал бы anyhow при выставленном RUST_BACKTRACE).
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Ошибка: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Криптопровайдер для TLS (wss://). Ошибка значит «уже установлен» — это нормально.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let db = match &cli.db {
-        Some(path) => Db::open(path)?,
-        None => Db::open_default(&cli.profile)?.0,
+    let path = match &cli.db {
+        Some(path) => path.clone(),
+        None => Db::default_path(&cli.profile)?,
     };
 
     match cli.command {
-        Command::Init => cmd_init(&db, &cli),
+        Command::Init { no_password } => return cmd_init(&path, &cli.profile, no_password),
+        Command::SetPassword => return cmd_set_password(&path),
+        Command::RemovePassword => return cmd_remove_password(&path),
+        _ => {}
+    }
+
+    let db = open_db(&path, true)?;
+    match cli.command {
+        Command::Init { .. } | Command::SetPassword | Command::RemovePassword => unreachable!(),
         Command::Whoami => cmd_whoami(&db, &cli),
         Command::SetUsername { username } => cmd_set_username(&db, &username),
         Command::ExportContact { out } => cmd_export_contact(&db, out),
@@ -203,12 +234,75 @@ fn load_identity(db: &Db) -> Result<(IdentityRow, Identity)> {
     Ok((row, id))
 }
 
-fn cmd_init(db: &Db, cli: &Cli) -> Result<()> {
-    if db.get_local_identity()?.is_some() {
-        let (row, _) = load_identity(db)?;
-        println!("Личность уже есть: {}", row.account_id);
-        return Ok(());
+/// Открыть базу профиля, спросив пароль, если она зашифрована.
+fn open_db(path: &Path, warn_if_plain: bool) -> Result<Db> {
+    match storage::file_state(path)? {
+        FileState::Missing => {
+            bail!("личность ещё не создана — сначала выполните `messenger init`")
+        }
+        FileState::Plain => {
+            let db = Db::open(path, None)?;
+            if warn_if_plain {
+                eprintln!(
+                    "⚠ база не зашифрована паролем: история и ключи лежат на диске открыто. \
+                     Зашифровать: `messenger set-password`"
+                );
+            }
+            Ok(db)
+        }
+        FileState::Encrypted => {
+            let pw = password::ask(password::ENV_PASSWORD, "Пароль от базы: ")?;
+            Db::open(path, Some(&pw))
+        }
     }
+}
+
+fn cmd_init(path: &Path, profile: &str, no_password: bool) -> Result<()> {
+    let state = storage::file_state(path)?;
+    if state != FileState::Missing {
+        let db = open_db(path, false)?;
+        if let Some(row) = db.get_local_identity()? {
+            println!("Личность уже есть: {}", row.account_id);
+            if state == FileState::Plain {
+                println!(
+                    "База не зашифрована — это можно сделать командой `messenger set-password`."
+                );
+            }
+            return Ok(());
+        }
+        if state == FileState::Encrypted {
+            // Зашифрованная база без личности: пароль уже введён, просто создаём.
+            return create_identity(&db, profile, true);
+        }
+    }
+
+    let pw = if no_password {
+        None
+    } else {
+        Some(password::ask_new(
+            password::ENV_PASSWORD,
+            "Придумайте пароль для базы",
+        )?)
+    };
+    match state {
+        FileState::Missing => {
+            let db = Db::open(path, pw.as_deref().map(|p| p.as_str()))?;
+            create_identity(&db, profile, pw.is_some())
+        }
+        _ => {
+            // Пустая незашифрованная база (например, от прошлой версии): создаём
+            // личность, затем шифруем файл целиком.
+            create_identity(&Db::open(path, None)?, profile, false)?;
+            if let Some(pw) = pw {
+                storage::reencrypt(path, None, Some(&pw))?;
+                println!("База зашифрована паролем.");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn create_identity(db: &Db, profile: &str, encrypted: bool) -> Result<()> {
     let id = Identity::generate_new();
     let account_id = id.account_id().to_string();
     db.upsert_identity(&IdentityRow {
@@ -220,11 +314,45 @@ fn cmd_init(db: &Db, cli: &Cli) -> Result<()> {
         sign_public: Some(id.sign_public_bytes()),
     })?;
     messaging::ensure_signed_prekey(db, &id)?;
-    println!("Создана новая личность для профиля `{}`.", cli.profile);
+    println!("Создана новая личность для профиля `{profile}`.");
     println!("account_id: {account_id}");
     println!("отпечаток:  {}", id.fingerprint());
+    if !encrypted {
+        println!("⚠ база не зашифрована паролем. Зашифровать: `messenger set-password`.");
+    }
     println!();
     println!("Дальше: `messenger set-username <имя>`, затем `messenger export-contact`.");
+    Ok(())
+}
+
+fn cmd_set_password(path: &Path) -> Result<()> {
+    match storage::file_state(path)? {
+        FileState::Missing => bail!("личность ещё не создана — сначала выполните `messenger init`"),
+        FileState::Plain => {
+            let new = password::ask_new(password::ENV_NEW_PASSWORD, "Придумайте пароль для базы")?;
+            storage::reencrypt(path, None, Some(&new))?;
+            println!("Готово: база зашифрована паролем.");
+        }
+        FileState::Encrypted => {
+            let current = password::ask(password::ENV_PASSWORD, "Текущий пароль: ")?;
+            let new = password::ask_new(password::ENV_NEW_PASSWORD, "Придумайте новый пароль")?;
+            storage::reencrypt(path, Some(&current), Some(&new))?;
+            println!("Готово: пароль изменён.");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_remove_password(path: &Path) -> Result<()> {
+    match storage::file_state(path)? {
+        FileState::Missing => bail!("личность ещё не создана — сначала выполните `messenger init`"),
+        FileState::Plain => println!("База и так без пароля."),
+        FileState::Encrypted => {
+            let current = password::ask(password::ENV_PASSWORD, "Текущий пароль: ")?;
+            storage::reencrypt(path, Some(&current), None)?;
+            println!("Пароль снят. ⚠ Теперь история и ключи лежат на диске открыто.");
+        }
+    }
     Ok(())
 }
 

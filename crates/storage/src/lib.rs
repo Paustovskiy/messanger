@@ -21,11 +21,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod encryption;
+pub use encryption::{FileState, PasswordRequired, WrongPassword, file_state, reencrypt};
+
 /// Текущая версия схемы.
 pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct Db {
     conn: Connection,
+    /// Общая блокировка файла базы, пока она открыта (см. [`encryption::reencrypt`]).
+    _lock: Option<fs::File>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,16 +177,34 @@ pub struct NewMessage<'a> {
 
 impl Db {
     /// Открыть (или создать) базу по пути и мигрировать до актуальной схемы.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    /// Открыть (или создать) базу по пути и мигрировать до актуальной схемы.
+    ///
+    /// `password`: для зашифрованной базы — обязателен; для новой — если задан,
+    /// база создаётся зашифрованной; для существующей незашифрованной — ошибка
+    /// (зашифровать её можно через [`encryption::reencrypt`]).
+    pub fn open(path: impl AsRef<Path>, password: Option<&str>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create dir {}", parent.display()))?;
         }
+        let lock = encryption::shared_lock(path)?;
+        let state = encryption::file_state(path)?;
         let conn =
             Connection::open(path).with_context(|| format!("open sqlite {}", path.display()))?;
+        match (state, password) {
+            (FileState::Encrypted, None) => return Err(PasswordRequired.into()),
+            (FileState::Encrypted, Some(pw)) => encryption::unlock(&conn, path, pw, false)?,
+            (FileState::Missing, Some(pw)) => encryption::unlock(&conn, path, pw, true)?,
+            (FileState::Plain, Some(_)) => {
+                bail!("база не зашифрована паролем — сначала зашифруйте её")
+            }
+            (FileState::Missing | FileState::Plain, None) => {}
+        }
         restrict_file_permissions(path)?;
-        Self::init(conn)
+        let mut db = Self::init(conn)?;
+        db._lock = Some(lock);
+        Ok(db)
     }
 
     /// База в памяти — для тестов.
@@ -189,18 +212,16 @@ impl Db {
         Self::init(Connection::open_in_memory()?)
     }
 
-    /// Открыть базу в стандартном каталоге данных ОС для профиля `app_name`
+    /// Путь к базе профиля в стандартном каталоге данных ОС
     /// (например, `~/.local/share/<app_name>/messenger.sqlite` на Linux).
-    pub fn open_default(app_name: &str) -> Result<(Self, PathBuf)> {
+    /// Каталог создаётся и закрывается от других пользователей.
+    pub fn default_path(app_name: &str) -> Result<PathBuf> {
         let proj = ProjectDirs::from("ru", "messenger", app_name)
             .context("cannot determine the data directory for this OS")?;
         let dir = proj.data_dir();
         fs::create_dir_all(dir).with_context(|| format!("create dir {}", dir.display()))?;
         restrict_permissions(dir)?;
-
-        let path = dir.join("messenger.sqlite");
-        let db = Self::open(&path)?;
-        Ok((db, path))
+        Ok(dir.join("messenger.sqlite"))
     }
 
     fn init(mut conn: Connection) -> Result<Self> {
@@ -213,7 +234,7 @@ impl Db {
              PRAGMA synchronous = NORMAL;",
         )?;
         migrate(&mut conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, _lock: None })
     }
 
     /// Выполнить `f` в эксклюзивной транзакции (`BEGIN IMMEDIATE`): всё, что

@@ -48,11 +48,11 @@ fn fresh_database_stores_and_loads_identity() {
     let path = tmp_path("fresh");
     let me = Identity::generate("acc-1");
     {
-        let db = Db::open(&path).unwrap();
+        let db = Db::open(&path, None).unwrap();
         assert!(db.get_local_identity().unwrap().is_none());
         db.upsert_identity(&identity_row(&me)).unwrap();
     }
-    let db = Db::open(&path).unwrap();
+    let db = Db::open(&path, None).unwrap();
     let row = db.get_local_identity().unwrap().unwrap();
     assert_eq!(row, identity_row(&me));
 
@@ -72,7 +72,7 @@ fn fresh_database_stores_and_loads_identity() {
 fn reopening_is_idempotent() {
     let path = tmp_path("reopen");
     for _ in 0..3 {
-        Db::open(&path).unwrap();
+        Db::open(&path, None).unwrap();
     }
 }
 
@@ -252,7 +252,7 @@ fn migrates_database_from_previous_version() {
         .unwrap();
     }
 
-    let db = Db::open(&path).unwrap();
+    let db = Db::open(&path, None).unwrap();
     let me = db.get_local_identity().unwrap().unwrap();
     assert_eq!(me.account_id, "legacy-acc");
     assert_eq!(me.sign_secret, Some(legacy.sign_secret_bytes()));
@@ -301,7 +301,7 @@ fn migrates_very_first_schema() {
         )
         .unwrap();
     }
-    let db = Db::open(&path).unwrap();
+    let db = Db::open(&path, None).unwrap();
     let me = db.get_local_identity().unwrap().unwrap();
     assert_eq!(me.account_id, "first-user");
     assert_eq!(me.sign_secret, None);
@@ -314,7 +314,7 @@ fn refuses_database_from_the_future() {
         .unwrap()
         .execute_batch("PRAGMA user_version = 99;")
         .unwrap();
-    let err = Db::open(&path).err().unwrap();
+    let err = Db::open(&path, None).err().unwrap();
     assert!(err.to_string().contains("newer"), "{err}");
 }
 
@@ -323,7 +323,7 @@ fn refuses_database_from_the_future() {
 fn database_file_is_private() {
     use std::os::unix::fs::PermissionsExt;
     let path = tmp_path("perms");
-    Db::open(&path).unwrap();
+    Db::open(&path, None).unwrap();
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 }
@@ -467,13 +467,16 @@ fn immediate_rolls_back_on_error() {
 #[test]
 fn concurrent_writers_do_not_lose_updates() {
     let path = tmp_path("concurrent");
-    Db::open(&path).unwrap().save_sessions("bob", "0").unwrap();
+    Db::open(&path, None)
+        .unwrap()
+        .save_sessions("bob", "0")
+        .unwrap();
 
     let workers: Vec<_> = (0..4)
         .map(|_| {
             let path = path.clone();
             std::thread::spawn(move || {
-                let db = Db::open(&path).unwrap();
+                let db = Db::open(&path, None).unwrap();
                 for _ in 0..25 {
                     db.immediate(|| {
                         let n: u32 = db.load_sessions("bob")?.unwrap().parse()?;
@@ -489,7 +492,7 @@ fn concurrent_writers_do_not_lose_updates() {
         w.join().unwrap();
     }
     assert_eq!(
-        Db::open(&path)
+        Db::open(&path, None)
             .unwrap()
             .load_sessions("bob")
             .unwrap()

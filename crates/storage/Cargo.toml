@@ -9,6 +9,9 @@ rust-version.workspace = true
 anyhow.workspace = true
 rusqlite.workspace = true
 directories.workspace = true
+argon2.workspace = true
+zeroize.workspace = true
+fs4.workspace = true
 
 [dev-dependencies]
 crypto_core.workspace = true
