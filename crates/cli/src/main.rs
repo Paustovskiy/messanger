@@ -1,751 +1,667 @@
-use anyhow::{Context, Result};
+//! `messenger` — консольный клиент.
+
+mod display;
+mod relay_client;
+mod session;
+
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use crypto_core::Identity;
-use protocol::{normalize_username, ContactCardPayload, ContactCardV2, EnvelopeB64, UserId};
-use storage::{Db, IdentityRow};
-use uuid::Uuid;
-use x25519_dalek::PublicKey;
-use base64::Engine as _;
-use chrono::{DateTime, Local, TimeZone};
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio::time::{timeout, Duration};
+use crypto_core::{Identity, envelope_id, verify_contact_card};
+use protocol::{ContactCardV2, Envelope, EnvelopeB64, normalize_username};
+use session::{Session, Step};
+use std::io::{IsTerminal, Read};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use storage::{
+    ContactRow, Db, DeliveryStatus, Direction, IdentityRow, NewMessage, PendingOutgoing,
+};
 
-
+/// Сколько ждать, пока релей примет сообщение.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
-#[command(name = "messenger-cli")]
-#[command(about = "Local E2EE CLI for testing without server", long_about = None)]
+#[command(name = "messenger", version)]
+#[command(about = "Мессенджер со сквозным шифрованием: консольный клиент")]
 struct Cli {
-    /// App name for storage directory (affects DB path)
-    #[arg(long, default_value = "messenger")]
-    app: String,
+    /// Имя профиля. У каждого профиля своя база и своя личность,
+    /// так можно запустить «Алису» и «Боба» на одном компьютере.
+    #[arg(
+        long,
+        global = true,
+        env = "MESSENGER_PROFILE",
+        default_value = "messenger",
+        alias = "app"
+    )]
+    profile: String,
+
+    /// Явный путь к файлу базы (вместо стандартного каталога профиля).
+    #[arg(long, global = true, env = "MESSENGER_DB")]
+    db: Option<PathBuf>,
+
+    /// Адрес релея.
+    #[arg(
+        long,
+        global = true,
+        env = "MESSENGER_RELAY",
+        default_value = "ws://127.0.0.1:8080/ws"
+    )]
+    relay: String,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Command,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Create identity if absent, otherwise show existing one
+enum Command {
+    /// Создать свою личность (ключи) — один раз.
     Init,
 
-    /// Set local @username (validated + normalized)
-    SetUsername {
-        username: String,
-    },
-
-    /// Show who am I: account_id, username, pubkey
+    /// Показать свой account_id, username и отпечаток ключей.
     Whoami,
 
-    /// Export ContactCard JSON for sharing
-    ExportContact,
+    /// Задать свой @username (5–32 символа: a–z, 0–9, _).
+    SetUsername { username: String },
 
-    /// Encrypt plaintext to recipient ContactCard (string or file)
-    Encrypt {
-        /// Recipient key: @username or account_id from saved contacts
-        to: String,
-        text: String,
+    /// Выдать свою карточку контакта (JSON), чтобы передать собеседнику.
+    ExportContact {
+        /// Записать в файл вместо вывода на экран.
+        #[arg(long, short)]
+        out: Option<PathBuf>,
     },
 
-    /// Decrypt EnvelopeB64 JSON (string or file)
-    Decrypt {
-        /// EnvelopeB64 JSON string
-        #[arg(long, conflicts_with = "envelope_file")]
-        envelope: Option<String>,
-
-        /// Path to file containing EnvelopeB64 JSON
-        #[arg(long)]
-        envelope_file: Option<String>,
-    },
-
-    /// Add or update contact from ContactCard JSON (string or file)
+    /// Добавить собеседника по его карточке (строкой, из файла или через stdin).
     AddContact {
         #[arg(long, conflicts_with = "contact_file")]
         contact: Option<String>,
         #[arg(long)]
-        contact_file: Option<String>,
+        contact_file: Option<PathBuf>,
     },
 
-    /// List saved contacts
+    /// Список контактов.
+    #[command(alias = "contacts")]
     ListContacts,
 
-    /// Remove contact by account_id
-    RemoveContact {
-        account_id: String,
-    },
+    /// Удалить контакт (по @username или account_id).
+    RemoveContact { who: String },
 
-    /// Send message to saved contact (@username or account_id), save to outbox, print envelope JSON
+    /// Отправить сообщение через релей.
     Send {
+        /// Кому: @username или account_id.
         to: String,
         text: String,
+        /// Не ходить на релей, а просто вывести зашифрованный конверт (JSON),
+        /// чтобы передать его любым способом. Получатель откроет его `receive`.
+        #[arg(long)]
+        offline: bool,
+        /// Сколько секунд ждать подтверждения доставки.
+        #[arg(long, default_value_t = 3)]
+        wait: u64,
     },
 
-    /// Receive (decrypt) envelope JSON, save to inbox, print plaintext
+    /// Открыть конверт, полученный вне релея (строкой, из файла или через stdin).
     Receive {
         #[arg(long, conflicts_with = "envelope_file")]
         envelope: Option<String>,
         #[arg(long)]
-        envelope_file: Option<String>,
+        envelope_file: Option<PathBuf>,
     },
 
-    /// Show chat history with contact (@username or account_id)
+    /// Быть онлайн: получать сообщения, дослать исходящие, переподключаться при обрыве.
+    Listen,
+
+    /// Дослать сообщения, которые ещё не доставлены.
+    RetryOutbox {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Сколько секунд ждать подтверждений доставки.
+        #[arg(long, default_value_t = 3)]
+        wait: u64,
+    },
+
+    /// История переписки с собеседником.
     Chat {
         with: String,
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
 
-    /// List dialogs (one per peer) with last message
+    /// Список диалогов.
     Threads {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-
-    /// Send message via relay server (encrypt + store outbox + send over WS)
-    SendOnline {
-        #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
-        url: String,
-        to: String,
-        text: String,
-    },
-
-    /// Listen on relay server, auto-decrypt incoming and store inbox
-    Listen {
-        #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
-        url: String,
-    },
-
-    /// Retry sending undelivered OUT messages (status=0) via relay
-    RetryOutbox {
-        #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
-        url: String,
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-    },
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum WsIn {
-    Register { account_id: String },
-    Send { to: String, msg_id: String, envelope: EnvelopeB64 },
-    Ack { to: String, msg_id: String },
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum WsOut {
-    Ack { message: String },
-    Error { message: String },
-    Deliver { from: String, msg_id: String, envelope: EnvelopeB64 },
-    DeliverAck { from: String, msg_id: String },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let (db, path) = Db::open_default(&cli.app)?;
-    // Удобно видеть путь при отладке
-    eprintln!("DB: {:?}", path);
+    // Криптопровайдер для TLS (wss://). Ошибка значит «уже установлен» — это нормально.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
-    match cli.command {
-        Commands::Init => cmd_init(&db)?,
-        Commands::SetUsername { username } => cmd_set_username(&db, &username)?,
-        Commands::Whoami => cmd_whoami(&db)?,
-        Commands::ExportContact => cmd_export_contact(&db)?,
-        Commands::Encrypt { to, text } => cmd_encrypt_to_saved(&db, &to, &text)?,
-        Commands::Decrypt {
-            envelope,
-            envelope_file,
-        } => cmd_decrypt(&db, envelope, envelope_file)?,
-        Commands::AddContact { contact, contact_file } => cmd_add_contact(&db, contact, contact_file)?,
-        Commands::ListContacts => cmd_list_contacts(&db)?,
-        Commands::RemoveContact { account_id } => cmd_remove_contact(&db, &account_id)?,
-        Commands::Send { to, text } => cmd_send(&db, &to, &text)?,
-        Commands::Receive { envelope, envelope_file } => cmd_receive(&db, envelope, envelope_file)?,
-        Commands::Chat { with, limit } => cmd_chat(&db, &with, limit)?,
-        Commands::Threads { limit } => cmd_threads(&db, limit)?,
-        Commands::SendOnline { url, to, text } => cmd_send_online(&db, &url, &to, &text)?,
-        Commands::Listen { url } => cmd_listen(&db, &url)?,
-        Commands::RetryOutbox { url, limit } => cmd_retry_outbox(&db, &url, limit)?,
-    }
-
-    Ok(())
-}
-
-fn load_or_create_identity(db: &Db) -> Result<(IdentityRow, Identity)> {
-    if let Some(row) = db.get_local_identity()? {
-        let id = Identity::from_secrets(
-            row.account_id.clone(),
-            row.secret,
-            row.sign_secret,
-        );
-        return Ok((row, id));
-    }
-
-    let account_id = Uuid::new_v4().to_string();
-    let id = Identity::generate(&account_id);
-
-    let row = IdentityRow {
-        account_id,
-        username: None,
-        secret: id.secret_bytes(),
-        public: id.public_bytes(),
-        sign_secret: id.sign_secret_bytes(),
-        sign_public: id.sign_public_bytes(),
+    let db = match &cli.db {
+        Some(path) => Db::open(path)?,
+        None => Db::open_default(&cli.profile)?.0,
     };
 
-    db.upsert_identity(&row)?;
+    match cli.command {
+        Command::Init => cmd_init(&db, &cli),
+        Command::Whoami => cmd_whoami(&db, &cli),
+        Command::SetUsername { username } => cmd_set_username(&db, &username),
+        Command::ExportContact { out } => cmd_export_contact(&db, out),
+        Command::AddContact {
+            contact,
+            contact_file,
+        } => cmd_add_contact(&db, contact, contact_file),
+        Command::ListContacts => cmd_list_contacts(&db),
+        Command::RemoveContact { who } => cmd_remove_contact(&db, &who),
+        Command::Send {
+            to,
+            text,
+            offline,
+            wait,
+        } => cmd_send(&db, &cli.relay, &to, &text, offline, wait),
+        Command::Receive {
+            envelope,
+            envelope_file,
+        } => cmd_receive(&db, envelope, envelope_file),
+        Command::Listen => cmd_listen(&db, &cli.relay),
+        Command::RetryOutbox { limit, wait } => cmd_retry_outbox(&db, &cli.relay, limit, wait),
+        Command::Chat { with, limit } => cmd_chat(&db, &with, limit),
+        Command::Threads { limit } => cmd_threads(&db, limit),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Личность
+// ---------------------------------------------------------------------------
+
+/// Загрузить свою личность. Личность из старой версии без ключа подписи
+/// автоматически получает его.
+fn load_identity(db: &Db) -> Result<(IdentityRow, Identity)> {
+    let Some(mut row) = db.get_local_identity()? else {
+        bail!("личность ещё не создана — сначала выполните `messenger init`");
+    };
+
+    let sign_secret = match row.sign_secret {
+        Some(s) => s,
+        None => {
+            let upgraded =
+                Identity::from_secrets(&row.account_id, row.secret, crypto_core::random_bytes());
+            row.sign_secret = Some(upgraded.sign_secret_bytes());
+            row.sign_public = Some(upgraded.sign_public_bytes());
+            db.upsert_identity(&row)?;
+            eprintln!(
+                "Обратите внимание: ваша личность создана старой версией и не имела ключа подписи. \
+                 Он только что сгенерирован — разошлите контактам свежую карточку (`messenger export-contact`)."
+            );
+            upgraded.sign_secret_bytes()
+        }
+    };
+
+    let id = Identity::from_secrets(&row.account_id, row.secret, sign_secret);
     Ok((row, id))
 }
 
-fn cmd_init(db: &Db) -> Result<()> {
-    let (row, _id) = load_or_create_identity(db)?;
+fn cmd_init(db: &Db, cli: &Cli) -> Result<()> {
+    if db.get_local_identity()?.is_some() {
+        let (row, _) = load_identity(db)?;
+        println!("Личность уже есть: {}", row.account_id);
+        return Ok(());
+    }
+    let id = Identity::generate_new();
+    let account_id = id.account_id().to_string();
+    db.upsert_identity(&IdentityRow {
+        account_id: account_id.clone(),
+        username: None,
+        secret: id.x_secret_bytes(),
+        public: id.x_public_bytes(),
+        sign_secret: Some(id.sign_secret_bytes()),
+        sign_public: Some(id.sign_public_bytes()),
+    })?;
+    println!("Создана новая личность для профиля `{}`.", cli.profile);
+    println!("account_id: {account_id}");
+    println!("отпечаток:  {}", id.fingerprint());
+    println!();
+    println!("Дальше: `messenger set-username <имя>`, затем `messenger export-contact`.");
+    Ok(())
+}
+
+fn cmd_whoami(db: &Db, cli: &Cli) -> Result<()> {
+    let (row, id) = load_identity(db)?;
+    println!("account_id: {}", row.account_id);
     println!(
-        "OK: account_id={}, username={:?}",
-        row.account_id, row.username
+        "username:   {}",
+        row.username.as_deref().unwrap_or("(не задан)")
     );
+    println!("отпечаток:  {}", id.fingerprint());
+    println!("профиль:    {}", cli.profile);
     Ok(())
 }
 
 fn cmd_set_username(db: &Db, username: &str) -> Result<()> {
-    let (row, _id) = load_or_create_identity(db)?;
-
-    let norm = normalize_username(username)
-        .map_err(|e| anyhow::anyhow!(e))
-        .context("username validation failed")?;
-
+    let (row, _) = load_identity(db)?;
+    let norm = normalize_username(username)?;
     db.set_username(&row.account_id, Some(&norm))?;
-    println!("OK: username set to {}", norm);
+    println!("Username теперь {norm}. Выгрузите карточку заново, чтобы его увидели собеседники.");
     Ok(())
 }
 
-fn cmd_whoami(db: &Db) -> Result<()> {
-    let (row, id) = load_or_create_identity(db)?;
-    println!("account_id: {}", row.account_id);
-    println!("username:   {}", row.username.as_deref().unwrap_or("(none)"));
-    println!(
-        "pubkey_b64: {}",
-        base64::engine::general_purpose::STANDARD_NO_PAD.encode(id.public_bytes())
-    );
-    Ok(())
-}
-
-fn cmd_export_contact(db: &Db) -> Result<()> {
-    let (row, id) = load_or_create_identity(db)?;
-
-    let payload = ContactCardPayload {
-        account_id: row.account_id.clone(),
-        username: row.username.clone(),
-        x25519_pub: id.public_bytes(),
-        ed25519_pub: id.sign_public_bytes(),
-    };
-
-    let payload_bytes = protocol::contact_card_payload_bytes(&payload)?;
-    let sig = id.sign(&payload_bytes);
-
-    let card = ContactCardV2::from_parts(
-        row.account_id,
-        row.username,
-        id.public_bytes(),
-        id.sign_public_bytes(),
-        sig,
-    );
-
-    let json = serde_json::to_string_pretty(&card)?;
-    println!("{}", json);
-    Ok(())
-}
-
-fn read_input_string(direct: Option<String>, file: Option<String>, what: &str) -> Result<String> {
-    if let Some(s) = direct {
-        return Ok(s);
+fn cmd_export_contact(db: &Db, out: Option<PathBuf>) -> Result<()> {
+    let (row, id) = load_identity(db)?;
+    let json = serde_json::to_string_pretty(&id.contact_card(row.username))?;
+    match out {
+        Some(path) => {
+            std::fs::write(&path, format!("{json}\n"))
+                .with_context(|| format!("не удалось записать {}", path.display()))?;
+            eprintln!("Карточка сохранена в {}", path.display());
+        }
+        None => println!("{json}"),
     }
-    if let Some(path) = file {
-        return Ok(std::fs::read_to_string(&path).with_context(|| format!("read {} file", what))?);
-    }
-
-    // Если не указано ни --what, ни --what-file, читаем stdin
-    use std::io::Read;
-    let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf).with_context(|| format!("read {} from stdin", what))?;
-    let buf = buf.trim().to_string();
-
-    if buf.is_empty() {
-        anyhow::bail!("provide --{} or --{}-file, or pipe {} JSON via stdin", what, what, what);
-    }
-    Ok(buf)
-}
-
-
-fn cmd_decrypt(db: &Db, envelope: Option<String>, envelope_file: Option<String>) -> Result<()> {
-    let (_row, me) = load_or_create_identity(db)?;
-
-    let env_json = read_input_string(envelope, envelope_file, "envelope")?;
-    let env_b64: EnvelopeB64 = serde_json::from_str(&env_json).context("parse EnvelopeB64 JSON")?;
-
-    let env = protocol::Envelope::try_from(env_b64).map_err(|e| anyhow::anyhow!(e))?;
-    let pt = me.decrypt(&env).map_err(|e| anyhow::anyhow!(e))?;
-
-    println!("{}", String::from_utf8_lossy(&pt));
     Ok(())
 }
 
-fn cmd_add_contact(db: &Db, contact: Option<String>, contact_file: Option<String>) -> Result<()> {
-    let contact_json = read_input_string(contact, contact_file, "contact")?;
+// ---------------------------------------------------------------------------
+// Контакты
+// ---------------------------------------------------------------------------
+
+fn cmd_add_contact(db: &Db, contact: Option<String>, file: Option<PathBuf>) -> Result<()> {
+    let (me, _) = load_identity(db)?;
+    let json = read_input(contact, file, "contact", "карточку контакта")?;
     let card: ContactCardV2 =
-        serde_json::from_str(&contact_json).context("parse ContactCardV2 JSON")?;
+        serde_json::from_str(&json).context("это не похоже на карточку контакта")?;
+    let v = verify_contact_card(&card).context("карточка контакта не прошла проверку подписи")?;
 
-    let payload = card.signing_payload();
-    let payload_bytes = protocol::contact_card_payload_bytes(&payload)?;
-
-    let ed25519_pub = card.ed25519_pub_bytes()?;
-    let sig = card.sig_bytes()?;
-
-    if !Identity::verify(ed25519_pub, &payload_bytes, sig) {
-        anyhow::bail!("contact card signature verification failed");
+    if v.account_id == me.account_id {
+        bail!("это ваша собственная карточка");
+    }
+    if let Some(u) = &v.username {
+        normalize_username(u).with_context(|| format!("в карточке недопустимый username {u:?}"))?;
+    }
+    if let Some(old) = db.get_contact(&v.account_id)? {
+        if old.sign_public.is_some_and(|k| k != v.ed25519_pub) || old.public != v.x25519_pub {
+            eprintln!(
+                "ВНИМАНИЕ: ключи этого контакта ИЗМЕНИЛИСЬ с момента добавления. Обязательно сверьте отпечаток!"
+            );
+        }
     }
 
-    let public = card.x25519_pub_bytes()?;
-    let row = storage::ContactRow {
-        account_id: card.account_id.clone(),
-        username: card.username.clone(),
-        public,
-    };
+    db.upsert_contact(&ContactRow {
+        account_id: v.account_id.clone(),
+        username: v.username.clone(),
+        public: v.x25519_pub,
+        sign_public: Some(v.ed25519_pub),
+    })?;
 
-    db.upsert_contact(&row)?;
     println!(
-        "OK: saved contact account_id={}, username={}",
-        row.account_id,
-        row.username.as_deref().unwrap_or("(none)")
+        "Контакт сохранён: {}",
+        v.username.as_deref().unwrap_or(&v.account_id)
+    );
+    println!("отпечаток: {}", v.fingerprint());
+    println!(
+        "Сверьте его с тем, что собеседник видит в `messenger whoami` (голосом или при встрече)."
     );
     Ok(())
 }
 
 fn cmd_list_contacts(db: &Db) -> Result<()> {
-    let items = db.list_contacts()?;
-    if items.is_empty() {
-        println!("(no contacts)");
+    let contacts = db.list_contacts()?;
+    if contacts.is_empty() {
+        println!("(контактов пока нет — добавьте через `messenger add-contact`)");
         return Ok(());
     }
+    for c in contacts {
+        let fp = match c.sign_public {
+            Some(k) => crypto_core::fingerprint(&c.public, &k),
+            None => "⚠ старая карточка без ключа подписи — добавьте заново".into(),
+        };
+        println!("{:<20} {}  {}", display::contact_name(&c), c.account_id, fp);
+    }
+    Ok(())
+}
 
-    for c in items {
-        println!(
-            "{}\t{}\t{}",
-            c.account_id,
-            c.username.as_deref().unwrap_or("(none)"),
-            base64::engine::general_purpose::STANDARD_NO_PAD.encode(c.public)
+fn cmd_remove_contact(db: &Db, who: &str) -> Result<()> {
+    let c = find_contact(db, who)?;
+    db.delete_contact(&c.account_id)?;
+    println!("Удалён контакт {}", display::contact_name(&c));
+    Ok(())
+}
+
+fn find_contact(db: &Db, who: &str) -> Result<ContactRow> {
+    db.find_contact(who)?
+        .with_context(|| format!("контакт {who:?} не найден — см. `messenger list-contacts`"))
+}
+
+// ---------------------------------------------------------------------------
+// Отправка и приём
+// ---------------------------------------------------------------------------
+
+fn cmd_send(db: &Db, relay: &str, to: &str, text: &str, offline: bool, wait: u64) -> Result<()> {
+    let (_, me) = load_identity(db)?;
+    let contact = find_contact(db, to)?;
+    if text.trim().is_empty() {
+        bail!("пустое сообщение");
+    }
+
+    let env = me.encrypt_to(&contact.account_id, &contact.public, text.as_bytes())?;
+    let msg_id = envelope_id(&env);
+    let wire = EnvelopeB64::from(&env);
+    let envelope_json = serde_json::to_string(&wire)?;
+
+    // Сначала сохраняем — сообщение не потеряется, даже если сеть недоступна.
+    db.insert_message(&NewMessage {
+        direction: Direction::Out,
+        peer_account_id: &contact.account_id,
+        peer_username: contact.username.as_deref(),
+        plaintext: text,
+        envelope_json: &envelope_json,
+        msg_id: &msg_id,
+    })?;
+
+    if offline {
+        println!("{}", serde_json::to_string_pretty(&wire)?);
+        eprintln!(
+            "Передайте этот конверт собеседнику ({}) — он откроет его командой `messenger receive`.",
+            display::contact_name(&contact)
         );
-    }
-    Ok(())
-}
-
-fn cmd_remove_contact(db: &Db, account_id: &str) -> Result<()> {
-    db.delete_contact(account_id)?;
-    println!("OK: removed {}", account_id);
-    Ok(())
-}
-
-fn cmd_encrypt_to_saved(db: &Db, to_key: &str, text: &str) -> Result<()> {
-    let (_row, me) = load_or_create_identity(db)?;
-
-    let c = db
-        .find_contact(to_key)?
-        .with_context(|| format!("contact not found: {}", to_key))?;
-
-    let peer_pub = PublicKey::from(c.public);
-    let to = UserId(c.account_id.clone());
-
-    let env = me.encrypt_to(&peer_pub, to, text.as_bytes());
-    let env_b64: EnvelopeB64 = env.into();
-
-    let json = serde_json::to_string_pretty(&env_b64)?;
-    println!("{}", json);
-    Ok(())
-}
-fn cmd_send(db: &Db, to_key: &str, text: &str) -> Result<()> {
-    let (_row, me) = load_or_create_identity(db)?;
-
-    let c = db
-        .find_contact(to_key)?
-        .with_context(|| format!("contact not found: {}", to_key))?;
-
-    let peer_pub = PublicKey::from(c.public);
-    let to = UserId(c.account_id.clone());
-
-    let env = me.encrypt_to(&peer_pub, to, text.as_bytes());
-    let env_b64: EnvelopeB64 = env.into();
-
-    let env_json = serde_json::to_string_pretty(&env_b64)?;
-
-    let msg_id = Uuid::new_v4().to_string();
-    // save outbox
-    db.insert_message(
-        storage::Direction::Out,
-        &c.account_id,
-        c.username.as_deref(),
-        text,
-        &env_json,
-        Some(&msg_id)
-    )?;
-
-    // print envelope for copy/paste or transport layer
-    println!("{}", env_json);
-    Ok(())
-}
-
-fn cmd_receive(db: &Db, envelope: Option<String>, envelope_file: Option<String>) -> Result<()> {
-    let (_row, me) = load_or_create_identity(db)?;
-
-    let env_json = read_input_string(envelope, envelope_file, "envelope")?;
-    let env_b64: EnvelopeB64 = serde_json::from_str(&env_json).context("parse EnvelopeB64 JSON")?;
-    let env = protocol::Envelope::try_from(env_b64).map_err(|e| anyhow::anyhow!(e))?;
-
-    let pt = me.decrypt(&env).map_err(|e| anyhow::anyhow!(e))?;
-    let plaintext = String::from_utf8_lossy(&pt).to_string();
-
-    // sender is env.from (account_id)
-    let peer_id = env.from.0.clone();
-
-    // try to resolve username snapshot from contacts (optional)
-    let peer_username = db
-        .find_contact(&peer_id)?
-        .and_then(|c| c.username);
-
-    let msg_id = Uuid::new_v4().to_string();
-    db.insert_message(
-        storage::Direction::In,
-        &peer_id,
-        peer_username.as_deref(),
-        &plaintext,
-        &env_json,
-        Some(&msg_id)
-    )?;
-
-    println!("{}", plaintext);
-    Ok(())
-}
-
-fn cmd_chat(db: &Db, with_key: &str, limit: usize) -> Result<()> {
-    // Resolve peer account_id
-    let peer = db
-        .find_contact(with_key)?
-        .with_context(|| format!("contact not found: {}", with_key))?;
-
-    let items = db.list_messages_for_peer_resolved(&peer.account_id, limit)?;
-
-    if items.is_empty() {
-        println!("(no messages with {})", peer.username.as_deref().unwrap_or(&peer.account_id));
         return Ok(());
     }
 
-    for m in items {
-        let dir = match m.direction {
-            storage::Direction::In => "IN ",
-            storage::Direction::Out => "OUT",
-        };
+    let pending = PendingOutgoing {
+        peer_account_id: contact.account_id.clone(),
+        msg_id: msg_id.clone(),
+        envelope_json,
+    };
 
-        // Пока выводим unix timestamp. Позже красиво отформатируем на клиенте/UI.
-        let dt: DateTime<Local> = Local.timestamp_opt(m.created_at, 0).single().unwrap();
+    runtime()?.block_on(async {
+        let mut s = Session::open(relay, db, &me).await.context(
+            "релей недоступен; сообщение сохранено в исходящих и уйдёт при \
+             `messenger listen` или `messenger retry-outbox`",
+        )?;
+        s.send_pending(&pending).await?;
 
-        let status_mark = match m.direction {
-            storage::Direction::Out => {
-                if m.status >= 1 { " ✓✓" } else { " ✓" }
+        let ids = [msg_id.clone()];
+        wait_for(&mut s, ACCEPT_TIMEOUT, |s| all_settled(s, &ids)).await?;
+        if let Some(reason) = s.rejected.get(&msg_id) {
+            bail!("релей отклонил сообщение: {reason}");
+        }
+        if !s.accepted.contains(&msg_id) {
+            bail!("релей не подтвердил приём; сообщение осталось в исходящих");
+        }
+        println!("✓  отправлено: {}", display::contact_name(&contact));
+
+        wait_for(&mut s, Duration::from_secs(wait), |s| {
+            s.delivered.contains(&msg_id)
+        })
+        .await?;
+        if !s.delivered.contains(&msg_id) {
+            println!("   собеседник не в сети — релей доставит, как только он подключится");
+        }
+        s.close().await;
+        Ok(())
+    })
+}
+
+fn cmd_receive(db: &Db, envelope: Option<String>, file: Option<PathBuf>) -> Result<()> {
+    let (_, me) = load_identity(db)?;
+    let json = read_input(envelope, file, "envelope", "конверт")?;
+    let wire: EnvelopeB64 =
+        serde_json::from_str(&json).context("это не похоже на конверт сообщения")?;
+    let env = Envelope::try_from(&wire)?;
+
+    let contact = db.get_contact(&env.from)?.with_context(|| {
+        format!(
+            "сообщение от неизвестного аккаунта {}; сначала добавьте его карточку",
+            env.from
+        )
+    })?;
+    let sign_pub = contact.sign_public.context(
+        "контакт добавлен старой версией без ключа подписи; добавьте его карточку заново",
+    )?;
+
+    let plaintext = me
+        .decrypt(&env, &sign_pub)
+        .context("не удалось открыть сообщение")?;
+    let text = String::from_utf8_lossy(&plaintext);
+
+    let inserted = db.insert_message(&NewMessage {
+        direction: Direction::In,
+        peer_account_id: &contact.account_id,
+        peer_username: contact.username.as_deref(),
+        plaintext: &text,
+        envelope_json: &serde_json::to_string(&wire)?,
+        msg_id: &envelope_id(&env),
+    })?;
+
+    println!("{}: {}", display::contact_name(&contact), text);
+    if inserted.is_none() {
+        eprintln!("(это сообщение уже было получено раньше)");
+    }
+    Ok(())
+}
+
+fn cmd_listen(db: &Db, relay: &str) -> Result<()> {
+    let (row, me) = load_identity(db)?;
+    let name = row.username.unwrap_or(row.account_id);
+
+    runtime()?.block_on(async {
+        let listen = async {
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                match Session::open(relay, db, &me).await {
+                    Ok(mut s) => {
+                        backoff = Duration::from_secs(1);
+                        println!("В сети как {name} ({relay}). Ctrl+C — выйти.");
+
+                        let pending = db.list_pending_outgoing(1000)?;
+                        for p in &pending {
+                            s.send_pending(p).await?;
+                        }
+                        if !pending.is_empty() {
+                            println!("Досылаю из исходящих: {}", pending.len());
+                        }
+
+                        loop {
+                            match s.step(None).await {
+                                Ok(Step::Closed) => break,
+                                Ok(_) => {}
+                                Err(e) => {
+                                    eprintln!("ошибка соединения: {e:#}");
+                                    break;
+                                }
+                            }
+                        }
+                        eprintln!("Соединение потеряно.");
+                    }
+                    Err(e) => eprintln!("{e:#}"),
+                }
+                eprintln!("Переподключение через {} с…", backoff.as_secs());
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
             }
-            storage::Direction::In => "",
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
         };
 
+        tokio::select! {
+            r = listen => r,
+            _ = shutdown_signal() => {
+                println!();
+                Ok(())
+            }
+        }
+    })
+}
+
+fn cmd_retry_outbox(db: &Db, relay: &str, limit: usize, wait: u64) -> Result<()> {
+    let (_, me) = load_identity(db)?;
+    let pending = db.list_pending_outgoing(limit)?;
+    if pending.is_empty() {
+        println!("Исходящие пусты — всё доставлено.");
+        return Ok(());
+    }
+
+    runtime()?.block_on(async {
+        let mut s = Session::open(relay, db, &me).await?;
+        for p in &pending {
+            s.send_pending(p).await?;
+        }
+        let ids: Vec<String> = pending.iter().map(|p| p.msg_id.clone()).collect();
+
+        wait_for(&mut s, ACCEPT_TIMEOUT, |s| all_settled(s, &ids)).await?;
+        wait_for(&mut s, Duration::from_secs(wait), |s| {
+            ids.iter().all(|id| s.delivered.contains(id) || s.rejected.contains_key(id))
+        })
+        .await?;
+
+        let accepted = ids.iter().filter(|id| s.accepted.contains(*id)).count();
+        let delivered = ids.iter().filter(|id| s.delivered.contains(*id)).count();
+        let rejected = ids.iter().filter(|id| s.rejected.contains_key(*id)).count();
         println!(
-            "[{}] {} {}{}: {}",
-            dt.format("%Y-%m-%d %H:%M:%S"),
-            dir,
-            m.peer_username.as_deref().unwrap_or(&m.peer_account_id),
-            status_mark,
+            "Исходящих: {} — принято релеем {accepted}, доставлено {delivered}, отклонено {rejected}.",
+            ids.len()
+        );
+        s.close().await;
+        Ok(())
+    })
+}
+
+fn all_settled(s: &Session<'_>, ids: &[String]) -> bool {
+    ids.iter()
+        .all(|id| s.accepted.contains(id) || s.rejected.contains_key(id))
+}
+
+/// Обрабатывать события релея, пока не выполнится `done` или не выйдет время.
+async fn wait_for(
+    s: &mut Session<'_>,
+    timeout: Duration,
+    done: impl Fn(&Session<'_>) -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !done(s) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match s.step(Some(left)).await? {
+            Step::Handled => {}
+            Step::Timeout => break,
+            Step::Closed => bail!("релей закрыл соединение"),
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// История
+// ---------------------------------------------------------------------------
+
+fn cmd_chat(db: &Db, with: &str, limit: usize) -> Result<()> {
+    let peer = find_contact(db, with)?;
+    let messages = db.list_messages_for_peer(&peer.account_id, limit)?;
+    if messages.is_empty() {
+        println!("(с {} пока нет сообщений)", display::contact_name(&peer));
+        return Ok(());
+    }
+    let name = display::contact_name(&peer);
+    for m in messages {
+        let (who, mark) = match m.direction {
+            Direction::In => (name.as_str(), ""),
+            Direction::Out => (
+                "я",
+                match m.status {
+                    DeliveryStatus::Delivered => " ✓✓",
+                    DeliveryStatus::Pending => " ✓",
+                },
+            ),
+        };
+        println!(
+            "[{}] {who}{mark}: {}",
+            display::timestamp(m.created_at),
             m.plaintext
         );
     }
-
     db.mark_thread_read(&peer.account_id)?;
-
     Ok(())
 }
 
 fn cmd_threads(db: &Db, limit: usize) -> Result<()> {
-    let items = db.list_threads_resolved(limit)?;
-
-    if items.is_empty() {
-        println!("(no dialogs yet)");
+    let threads = db.list_threads(limit)?;
+    if threads.is_empty() {
+        println!("(диалогов пока нет)");
         return Ok(());
     }
-
-    for t in items {
-        let dt: DateTime<Local> = Local.timestamp_opt(t.last_created_at, 0).single().unwrap();
-
-        let dir = match t.last_direction {
-            storage::Direction::In => "IN ",
-            storage::Direction::Out => "OUT",
-        };
-
+    for t in threads {
         let who = t.peer_username.as_deref().unwrap_or(&t.peer_account_id);
-
         let unread = if t.unread_count > 0 {
-            format!(" (+{})", t.unread_count)
+            format!(" ({} новых)", t.unread_count)
         } else {
             String::new()
         };
-
-        
-        let mark: &str = match t.last_direction {
-            storage::Direction::Out => {
-                if t.last_status >= 1 { " ✓✓" } else { " ✓" }
-            }
-            storage::Direction::In => "",
+        let prefix = match (t.last_direction, t.last_status) {
+            (Direction::In, _) => "",
+            (Direction::Out, DeliveryStatus::Delivered) => "я ✓✓: ",
+            (Direction::Out, DeliveryStatus::Pending) => "я ✓: ",
         };
-
         println!(
-            "[{}] {} {}{}{}: {}",
-            dt.format("%Y-%m-%d %H:%M:%S"),
-            dir,
-            who,
-            unread,
-            mark,
-            t.last_plaintext
+            "[{}] {who}{unread} — {prefix}{}",
+            display::timestamp(t.last_created_at),
+            display::preview(&t.last_plaintext, 60)
         );
     }
-
     Ok(())
 }
 
-fn cmd_send_online(db: &Db, url: &str, to_key: &str, text: &str) -> Result<()> {
-    // создаём runtime, чтобы не переписывать весь CLI на async
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        let (_row, me) = load_or_create_identity(db)?;
+// ---------------------------------------------------------------------------
+// Помощники
+// ---------------------------------------------------------------------------
 
-        let c = db
-            .find_contact(to_key)?
-            .with_context(|| format!("contact not found: {}", to_key))?;
-
-        let peer_pub = PublicKey::from(c.public);
-        let to = UserId(c.account_id.clone());
-
-        let env = me.encrypt_to(&peer_pub, to, text.as_bytes());
-        let env_b64: EnvelopeB64 = env.into();
-
-        let env_json = serde_json::to_string_pretty(&env_b64)?;
-
-        let msg_id = Uuid::new_v4().to_string();
-        // сохранить outbox (как в send)
-        db.insert_message(
-            storage::Direction::Out,
-            &c.account_id,
-            c.username.as_deref(),
-            text,
-            &env_json,
-            Some(&msg_id)
-        )?;
-
-        // WS connect + register + send
-        let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await?;
-
-        // register
-        let reg = WsIn::Register {
-            account_id: me.user_id.0.clone(),
-        };
-        ws.send(WsMessage::Text(serde_json::to_string(&reg)?)).await?;
-
-        // send
-        let msg = WsIn::Send {
-            to: c.account_id.clone(),
-            msg_id: msg_id.clone(),
-            envelope: env_b64,
-        };
-
-        ws.send(WsMessage::Text(serde_json::to_string(&msg)?)).await?;
-
-        let mut delivered = false;
-
-        while let Ok(Some(Ok(WsMessage::Text(t)))) =
-            timeout(Duration::from_secs(5), ws.next()).await
-        {
-            if let Ok(ev) = serde_json::from_str::<WsOut>(&t) {
-                match ev {
-                    WsOut::DeliverAck { from, msg_id: ack_msg_id } => {
-                        // важно: сверяем msg_id, чтобы не поймать "чужой" ack
-                        if ack_msg_id == msg_id {
-                            db.mark_out_delivered(&from, &ack_msg_id)?;
-                            println!("DELIVERED to {} msg_id={}", from, ack_msg_id);
-                            delivered = true;
-                            break;
-                        }
-                    }
-                    WsOut::Error { message } => {
-                        eprintln!("server error: {}", message);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if !delivered {
-            eprintln!("WARN: no DeliverAck within timeout for msg_id={}", msg_id);
-        }
-
-        // optionally read quickly (non-blocking best-effort)
-        // then close
-        let _ = ws.close(None).await;
-
-        println!("OK: sent online to {}", c.username.as_deref().unwrap_or(&c.account_id));
-        Ok::<_, anyhow::Error>(())
-    })
+/// Взять JSON из аргумента, из файла или из stdin.
+fn read_input(
+    direct: Option<String>,
+    file: Option<PathBuf>,
+    flag: &str,
+    what: &str,
+) -> Result<String> {
+    if let Some(s) = direct {
+        return Ok(s);
+    }
+    if let Some(path) = file {
+        return std::fs::read_to_string(&path)
+            .with_context(|| format!("не удалось прочитать {}", path.display()));
+    }
+    if std::io::stdin().is_terminal() {
+        bail!("передайте {what}: --{flag} '<json>', --{flag}-file <путь> или через stdin");
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .with_context(|| format!("не удалось прочитать {what} из stdin"))?;
+    let buf = buf.trim().to_string();
+    if buf.is_empty() {
+        bail!("stdin пуст — ожидался {what} в формате JSON");
+    }
+    Ok(buf)
 }
 
-fn cmd_listen(db: &Db, url: &str) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        let (_row, me) = load_or_create_identity(db)?;
-
-        let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await?;
-
-        // register
-        let reg = WsIn::Register {
-            account_id: me.user_id.0.clone(),
-        };
-        ws.send(WsMessage::Text(serde_json::to_string(&reg)?)).await?;
-
-        println!("Listening on {} as {}", url, me.user_id.0);
-        while let Some(msg) = ws.next().await {
-            let msg = msg?;
-            if let WsMessage::Text(text) = msg {
-                let parsed: Result<WsOut, _> = serde_json::from_str(&text);
-                let Ok(ev) = parsed else {
-                    continue;
-                };
-
-                match ev {
-                    WsOut::Ack { .. } => {}
-
-                    WsOut::DeliverAck { from, msg_id } => {
-                        // тут дальше будет логика "пометить OUT как доставленное/прочитанное"
-                        // пока можно просто вывести:
-                        db.mark_out_delivered(&from, &msg_id)?;
-                        println!("DELIVERED to {} msg_id={}", from, msg_id);
-                    }
-
-                    WsOut::Error { message } => {
-                        eprintln!("server error: {}", message);
-                    }
-
-                    WsOut::Deliver { from, msg_id, envelope } => {
-                        // decrypt
-                        let env = protocol::Envelope::try_from(envelope)
-                            .map_err(|e| anyhow::anyhow!(e))?;
-
-                        let pt = me.decrypt(&env).map_err(|e| anyhow::anyhow!(e))?;
-                        let plaintext = String::from_utf8_lossy(&pt).to_string();
-
-                        // resolve username snapshot if present in contacts
-                        let peer_username = db
-                            .find_contact(&from)?
-                            .and_then(|c| c.username);
-
-                        let env_json = serde_json::to_string_pretty(&EnvelopeB64::from(env))?;
-
-                        // сохраняем входящее с тем же msg_id, что пришёл по сети
-                        db.insert_message(
-                            storage::Direction::In,
-                            &from,
-                            peer_username.as_deref(),
-                            &plaintext,
-                            &env_json,
-                            Some(&msg_id),
-                        )?;
-
-                        // <-- ВОТ ЗДЕСЬ ACK (после успешного сохранения)
-                        let ack = WsIn::Ack {
-                            to: from.clone(),
-                            msg_id: msg_id.clone(),
-                        };
-                        ws.send(WsMessage::Text(serde_json::to_string(&ack)?)).await?;
-
-                        println!(
-                            "FROM {}: {}",
-                            peer_username.as_deref().unwrap_or(&from),
-                            plaintext
-                        );
-                    }
-                }
-            }
-        }
-
-        Ok::<_, anyhow::Error>(())
-    })
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
 }
 
-fn cmd_retry_outbox(db: &Db, url: &str, limit: usize) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        let (_row, me) = load_or_create_identity(db)?;
-
-        // 1) load pending
-        let pending = db.list_pending_outgoing(limit)?;
-        if pending.is_empty() {
-            println!("OK: no pending outgoing messages");
-            return Ok::<_, anyhow::Error>(());
+/// Ждать Ctrl+C или SIGTERM (так завершают процесс systemd и `docker stop`).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
         }
-
-        // 2) connect + register
-        let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await?;
-
-        let reg = WsIn::Register {
-            account_id: me.user_id.0.clone(),
-        };
-        ws.send(WsMessage::Text(serde_json::to_string(&reg)?)).await?;
-
-        println!("Retrying {} pending messages...", pending.len());
-
-        // 3) send all
-        for (peer_account_id, msg_id, env_json) in pending {
-            let env_b64: EnvelopeB64 =
-                serde_json::from_str(&env_json).context("parse EnvelopeB64 from db")?;
-
-            let msg = WsIn::Send {
-                to: peer_account_id.clone(),
-                msg_id: msg_id.clone(),
-                envelope: env_b64,
-            };
-
-            ws.send(WsMessage::Text(serde_json::to_string(&msg)?)).await?;
-            println!("SENT retry to={} msg_id={}", peer_account_id, msg_id);
-        }
-
-        // 4) wait for acks (best-effort window)
-        // Мы просто слушаем входящие DeliverAck и отмечаем delivered.
-        let deadline = Duration::from_secs(5);
-        loop {
-            let next = timeout(deadline, ws.next()).await;
-            let Ok(Some(Ok(WsMessage::Text(t)))) = next else {
-                break; // timeout or closed
-            };
-
-            if let Ok(ev) = serde_json::from_str::<WsOut>(&t) {
-                match ev {
-                    WsOut::DeliverAck { from, msg_id } => {
-                        db.mark_out_delivered(&from, &msg_id)?;
-                        println!("ACK from={} msg_id={}", from, msg_id);
-                    }
-                    WsOut::Error { message } => {
-                        eprintln!("server error: {}", message);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let _ = ws.close(None).await;
-        println!("OK: retry done");
-        Ok::<_, anyhow::Error>(())
-    })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

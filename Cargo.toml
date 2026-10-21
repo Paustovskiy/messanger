@@ -1,15 +1,53 @@
-[package]
-name = "messanger"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-
 [workspace]
 resolver = "2"
-members = ["crates/cli",
-    "crates/crypto_core",
+members = [
     "crates/protocol",
+    "crates/crypto_core",
     "crates/storage",
-    "crates/cli", "crates/relay_server",
+    "crates/relay_server",
+    "crates/cli",
 ]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/Paustovskiy/messanger"
+
+[workspace.dependencies]
+# свои крейты
+protocol = { path = "crates/protocol" }
+crypto_core = { path = "crates/crypto_core" }
+storage = { path = "crates/storage" }
+relay_server = { path = "crates/relay_server" }
+
+# общее
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+
+# криптография
+rand = "0.8"
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+
+# хранилище
+rusqlite = { version = "0.32", features = ["bundled"] }
+directories = "5"
+
+# сеть
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+axum = { version = "0.7", features = ["ws"] }
+dashmap = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

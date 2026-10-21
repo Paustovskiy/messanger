@@ -1,0 +1,326 @@
+use crypto_core::Identity;
+use storage::*;
+
+fn tmp_path(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("messenger-test-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("db.sqlite")
+}
+
+fn identity_row(id: &Identity) -> IdentityRow {
+    IdentityRow {
+        account_id: id.account_id().to_string(),
+        username: None,
+        secret: id.x_secret_bytes(),
+        public: id.x_public_bytes(),
+        sign_secret: Some(id.sign_secret_bytes()),
+        sign_public: Some(id.sign_public_bytes()),
+    }
+}
+
+fn contact(account_id: &str, username: Option<&str>) -> ContactRow {
+    let id = Identity::generate(account_id);
+    ContactRow {
+        account_id: account_id.into(),
+        username: username.map(Into::into),
+        public: id.x_public_bytes(),
+        sign_public: Some(id.sign_public_bytes()),
+    }
+}
+
+fn msg<'a>(dir: Direction, peer: &'a str, text: &'a str, msg_id: &'a str) -> NewMessage<'a> {
+    NewMessage {
+        direction: dir,
+        peer_account_id: peer,
+        peer_username: None,
+        plaintext: text,
+        envelope_json: "{}",
+        msg_id,
+    }
+}
+
+/// Регрессия: в исходной версии первый `init` на пустой базе падал с
+/// `no such column: sign_secret`.
+#[test]
+fn fresh_database_stores_and_loads_identity() {
+    let path = tmp_path("fresh");
+    let me = Identity::generate("acc-1");
+    {
+        let db = Db::open(&path).unwrap();
+        assert!(db.get_local_identity().unwrap().is_none());
+        db.upsert_identity(&identity_row(&me)).unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    let row = db.get_local_identity().unwrap().unwrap();
+    assert_eq!(row, identity_row(&me));
+
+    db.set_username("acc-1", Some("@alice")).unwrap();
+    assert_eq!(
+        db.get_local_identity()
+            .unwrap()
+            .unwrap()
+            .username
+            .as_deref(),
+        Some("@alice")
+    );
+    assert!(db.set_username("nope", None).is_err());
+}
+
+#[test]
+fn reopening_is_idempotent() {
+    let path = tmp_path("reopen");
+    for _ in 0..3 {
+        Db::open(&path).unwrap();
+    }
+}
+
+#[test]
+fn contacts_lookup_by_id_and_username() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_contact(&contact("id-alice", Some("@alice")))
+        .unwrap();
+    db.upsert_contact(&contact("id-bob", None)).unwrap();
+
+    assert_eq!(
+        db.find_contact("id-alice").unwrap().unwrap().account_id,
+        "id-alice"
+    );
+    assert_eq!(
+        db.find_contact("@ALICE").unwrap().unwrap().account_id,
+        "id-alice"
+    );
+    assert_eq!(
+        db.find_contact("alice").unwrap().unwrap().account_id,
+        "id-alice"
+    );
+    assert!(db.find_contact("@carol").unwrap().is_none());
+    assert_eq!(db.list_contacts().unwrap().len(), 2);
+
+    assert!(db.delete_contact("id-bob").unwrap());
+    assert!(!db.delete_contact("id-bob").unwrap());
+}
+
+#[test]
+fn username_cannot_be_hijacked_by_another_contact() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_contact(&contact("id-alice", Some("@alice")))
+        .unwrap();
+
+    let err = db
+        .upsert_contact(&contact("id-mallory", Some("@Alice")))
+        .unwrap_err();
+    assert!(err.to_string().contains("already belongs"), "{err}");
+    assert_eq!(
+        db.find_contact("@alice").unwrap().unwrap().account_id,
+        "id-alice"
+    );
+
+    // А обновить собственную карточку можно.
+    db.upsert_contact(&contact("id-alice", Some("@alice")))
+        .unwrap();
+}
+
+#[test]
+fn duplicate_delivery_is_ignored() {
+    let db = Db::open_in_memory().unwrap();
+    assert!(
+        db.insert_message(&msg(Direction::In, "bob", "hi", "m1"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.insert_message(&msg(Direction::In, "bob", "hi", "m1"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(db.list_messages_for_peer("bob", 10).unwrap().len(), 1);
+
+    // Тот же msg_id от другого собеседника или в другую сторону — другое сообщение.
+    assert!(
+        db.insert_message(&msg(Direction::In, "carol", "hi", "m1"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.insert_message(&msg(Direction::Out, "bob", "hi", "m1"))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn chat_limit_returns_latest_messages_in_order() {
+    let db = Db::open_in_memory().unwrap();
+    for i in 0..5 {
+        db.insert_message(&msg(Direction::In, "bob", &i.to_string(), &format!("m{i}")))
+            .unwrap();
+    }
+    let last: Vec<_> = db
+        .list_messages_for_peer("bob", 2)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.plaintext)
+        .collect();
+    assert_eq!(last, ["3", "4"]);
+}
+
+#[test]
+fn threads_unread_and_delivery_status() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_contact(&contact("bob", Some("@bobby"))).unwrap();
+    db.insert_message(&msg(Direction::In, "bob", "one", "a"))
+        .unwrap();
+    db.insert_message(&msg(Direction::In, "bob", "two", "b"))
+        .unwrap();
+    db.insert_message(&msg(Direction::Out, "bob", "reply", "c"))
+        .unwrap();
+
+    let t = &db.list_threads(10).unwrap()[0];
+    assert_eq!(t.peer_username.as_deref(), Some("@bobby"));
+    assert_eq!(t.unread_count, 2);
+    assert_eq!(t.last_plaintext, "reply");
+    assert_eq!(t.last_status, DeliveryStatus::Pending);
+
+    db.mark_thread_read("bob").unwrap();
+    assert_eq!(db.list_threads(10).unwrap()[0].unread_count, 0);
+
+    assert_eq!(db.list_pending_outgoing(10).unwrap().len(), 1);
+    assert!(db.mark_out_delivered("bob", "c").unwrap());
+    assert!(
+        !db.mark_out_delivered("bob", "c").unwrap(),
+        "second ack changes nothing"
+    );
+    assert!(
+        !db.mark_out_delivered("mallory", "c").unwrap(),
+        "ack from wrong peer is ignored"
+    );
+    assert!(db.list_pending_outgoing(10).unwrap().is_empty());
+    assert_eq!(
+        db.list_threads(10).unwrap()[0].last_status,
+        DeliveryStatus::Delivered
+    );
+}
+
+/// База, созданная исходной версией проекта (схема v2 + ALTER-ы), открывается,
+/// данные сохраняются, а старая глобальная уникальность msg_id снимается.
+#[test]
+fn migrates_database_from_previous_version() {
+    let path = tmp_path("legacy-v2");
+    let legacy = Identity::generate("legacy-acc");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE identities (account_id TEXT PRIMARY KEY, username TEXT NULL,
+                 secret BLOB NOT NULL, public BLOB NOT NULL, created_at INTEGER NOT NULL);
+             ALTER TABLE identities ADD COLUMN sign_secret BLOB NULL;
+             ALTER TABLE identities ADD COLUMN sign_public BLOB NULL;
+             CREATE TABLE contacts (account_id TEXT PRIMARY KEY, username TEXT NULL,
+                 public BLOB NOT NULL, added_at INTEGER NOT NULL);
+             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, direction INTEGER NOT NULL,
+                 peer_account_id TEXT NOT NULL, peer_username TEXT NULL, created_at INTEGER NOT NULL,
+                 plaintext TEXT NOT NULL, envelope_json TEXT NOT NULL,
+                 is_read INTEGER NOT NULL DEFAULT 1, msg_id TEXT NULL, delivered_at INTEGER NULL,
+                 status INTEGER NOT NULL DEFAULT 0);
+             CREATE UNIQUE INDEX idx_messages_msg_id ON messages(msg_id);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO identities (account_id, username, secret, public, created_at, sign_secret, sign_public)
+             VALUES (?1, '@old', ?2, ?3, 1, ?4, ?5)",
+            rusqlite::params![
+                legacy.account_id(),
+                &legacy.x_secret_bytes()[..],
+                &legacy.x_public_bytes()[..],
+                &legacy.sign_secret_bytes()[..],
+                &legacy.sign_public_bytes()[..],
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO contacts VALUES ('bob', '@bobby', ?1, 1)",
+            rusqlite::params![&[7u8; 32][..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (direction, peer_account_id, created_at, plaintext, envelope_json, msg_id)
+             VALUES (1, 'bob', 1, 'old message', '{}', 'm1')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let me = db.get_local_identity().unwrap().unwrap();
+    assert_eq!(me.account_id, "legacy-acc");
+    assert_eq!(me.sign_secret, Some(legacy.sign_secret_bytes()));
+
+    let bob = db.find_contact("@bobby").unwrap().unwrap();
+    assert_eq!(
+        bob.sign_public, None,
+        "old contacts have no signing key yet"
+    );
+
+    assert_eq!(
+        db.list_messages_for_peer("bob", 10).unwrap()[0].plaintext,
+        "old message"
+    );
+    // Раньше это упало бы на UNIQUE(msg_id).
+    assert!(
+        db.insert_message(&msg(Direction::In, "bob", "x", "m1"))
+            .unwrap()
+            .is_some()
+    );
+
+    let v: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION);
+}
+
+/// Самая первая схема с `user_id` вместо `account_id` и без ключа подписи.
+#[test]
+fn migrates_very_first_schema() {
+    let path = tmp_path("legacy-v1");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE identities (user_id TEXT PRIMARY KEY, secret BLOB NOT NULL,
+                 public BLOB NOT NULL, created_at INTEGER NOT NULL);
+             CREATE INDEX idx_identities_created_at ON identities(created_at);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO identities VALUES ('first-user', ?1, ?2, 1)",
+            rusqlite::params![&[1u8; 32][..], &[2u8; 32][..]],
+        )
+        .unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    let me = db.get_local_identity().unwrap().unwrap();
+    assert_eq!(me.account_id, "first-user");
+    assert_eq!(me.sign_secret, None);
+}
+
+#[test]
+fn refuses_database_from_the_future() {
+    let path = tmp_path("future");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 99;")
+        .unwrap();
+    let err = Db::open(&path).err().unwrap();
+    assert!(err.to_string().contains("newer"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn database_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = tmp_path("perms");
+    Db::open(&path).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}

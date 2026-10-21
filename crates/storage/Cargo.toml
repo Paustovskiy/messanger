@@ -1,15 +1,14 @@
 [package]
 name = "storage"
-version = "0.1.0"
-edition = "2024"
+description = "Локальная SQLite-база клиента: личность, контакты, сообщения"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-anyhow = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
-directories = "5"
-uuid = { version = "1", features = ["v4"] }
+anyhow.workspace = true
+rusqlite.workspace = true
+directories.workspace = true
 
 [dev-dependencies]
-crypto_core = { path = "../crypto_core" }
-protocol = { path = "../protocol" }
-base64 = "0.22"
+crypto_core.workspace = true
