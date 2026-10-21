@@ -1,17 +1,19 @@
 //! Онлайн-сессия: соединение с релеем + обработка всего, что от него приходит.
 //!
 //! Любое подключение к релею сразу получает накопившуюся очередь, поэтому
-//! входящие сообщения обрабатываются в любой команде (`send`, `retry-outbox`,
-//! `listen`), а не только в `listen`.
+//! входящие сообщения обрабатываются в любой команде (`send`, `sync`,
+//! `listen`), а не только в `listen`. Там же, при каждом подключении, клиент
+//! следит за запасом своих предключей на релее и пополняет его.
 
 use crate::display;
+use crate::messaging::{self, Incoming};
 use crate::relay_client::RelayConn;
 use anyhow::Result;
-use crypto_core::Identity;
-use protocol::{ClientMessage, Envelope, EnvelopeB64, ServerMessage};
+use crypto_core::{Bundle, Identity};
+use protocol::{ClientMessage, EnvelopeB64, OneTimePrekey, ServerMessage, SignedPrekey};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use storage::{Db, Direction, NewMessage, PendingOutgoing};
+use storage::{Db, PendingOutgoing};
 
 pub enum Step {
     Handled,
@@ -29,6 +31,10 @@ pub struct Session<'a> {
     pub delivered: HashSet<String>,
     /// msg_id, которые релей отклонил, с причиной.
     pub rejected: HashMap<String, String>,
+    /// Ответы на `FetchBundle`: `None` — собеседник ещё не публиковал предключи.
+    pub bundles: HashMap<String, Option<Bundle>>,
+    /// Релей выдал всю накопившуюся очередь (пришёл первый `PrekeyStatus`).
+    pub synced: bool,
 }
 
 impl<'a> Session<'a> {
@@ -41,6 +47,8 @@ impl<'a> Session<'a> {
             accepted: HashSet::new(),
             delivered: HashSet::new(),
             rejected: HashMap::new(),
+            bundles: HashMap::new(),
+            synced: false,
         })
     }
 
@@ -49,9 +57,14 @@ impl<'a> Session<'a> {
         let envelope: EnvelopeB64 = match serde_json::from_str(&p.envelope_json) {
             Ok(e) => e,
             Err(_) => {
-                // Сообщение из старой версии без подписи — релей его не примет.
-                let reason = "сохранено старой версией в устаревшем формате — отправьте заново";
-                eprintln!("! пропускаю сообщение {} из исходящих: {reason}", p.msg_id);
+                // Сообщение, зашифрованное старой версией: новый релей его не примет,
+                // а получатель не откроет. Убираем из очереди, чтобы не крутилось вечно.
+                let reason = "зашифровано старой версией — отправьте его заново";
+                eprintln!(
+                    "! сообщение {} из исходящих не отправить: {reason}",
+                    p.msg_id
+                );
+                self.db.mark_out_failed(&p.peer_account_id, &p.msg_id)?;
                 self.rejected.insert(p.msg_id.clone(), reason.into());
                 return Ok(());
             }
@@ -61,6 +74,15 @@ impl<'a> Session<'a> {
                 to: p.peer_account_id.clone(),
                 msg_id: p.msg_id.clone(),
                 envelope,
+            })
+            .await
+    }
+
+    /// Запросить предключи собеседника; ответ появится в [`bundles`](Self::bundles).
+    pub async fn fetch_bundle(&mut self, account_id: &str) -> Result<()> {
+        self.conn
+            .send(&ClientMessage::FetchBundle {
+                account_id: account_id.into(),
             })
             .await
     }
@@ -104,6 +126,34 @@ impl<'a> Session<'a> {
             ServerMessage::Accepted { msg_id } => {
                 self.accepted.insert(msg_id);
             }
+            ServerMessage::PrekeyStatus {
+                has_signed_prekey,
+                one_time_left,
+            } => {
+                self.synced = true;
+                if let Some(publish) = messaging::prekeys_to_publish(
+                    self.db,
+                    self.me,
+                    has_signed_prekey,
+                    one_time_left,
+                )? {
+                    self.conn.send(&publish).await?;
+                }
+            }
+            ServerMessage::Bundle {
+                account_id,
+                signed_prekey,
+                one_time,
+            } => {
+                let bundle = match signed_prekey {
+                    Some(spk) => Some(Bundle {
+                        signed_prekey: SignedPrekey::try_from(&spk)?,
+                        one_time: one_time.as_ref().map(OneTimePrekey::try_from).transpose()?,
+                    }),
+                    None => None,
+                };
+                self.bundles.insert(account_id, bundle);
+            }
             ServerMessage::Error {
                 message,
                 msg_id: Some(id),
@@ -130,54 +180,34 @@ impl<'a> Session<'a> {
             );
             return Ok(());
         };
-        let Some(sign_pub) = contact.sign_public else {
+        if contact.sign_public.is_none() {
             eprintln!(
                 "! на релее ждёт сообщение от {}, но этот контакт добавлен старой версией \
                  без ключа подписи. Добавьте его карточку заново.",
                 display::contact_name(&contact)
             );
             return Ok(());
-        };
+        }
 
-        let opened = Envelope::try_from(&wire)
-            .map_err(anyhow::Error::from)
-            .and_then(|env| {
-                if env.from != from {
-                    anyhow::bail!(
-                        "отправитель в конверте не совпадает с отправителем по данным релея"
-                    );
-                }
-                Ok(self.me.decrypt(&env, &sign_pub)?)
-            });
-
-        match opened {
-            Ok(plaintext) => {
-                let text = String::from_utf8_lossy(&plaintext);
-                let envelope_json = serde_json::to_string(&wire)?;
-                let inserted = self.db.insert_message(&NewMessage {
-                    direction: Direction::In,
-                    peer_account_id: &from,
-                    peer_username: contact.username.as_deref(),
-                    plaintext: &text,
-                    envelope_json: &envelope_json,
-                    msg_id: &msg_id,
-                })?;
-                if inserted.is_some() {
-                    println!(
-                        "{} {}: {}",
-                        display::now(),
-                        display::contact_name(&contact),
-                        text
-                    );
-                }
+        match messaging::open_and_store(self.db, self.me, &contact, &wire, &msg_id) {
+            Ok(Incoming::New(text)) => {
+                println!(
+                    "{} {}: {}",
+                    display::now(),
+                    display::contact_name(&contact),
+                    text
+                );
             }
-            Err(e) => {
-                // Подделку или битое сообщение подтверждаем, чтобы релей перестал его слать.
+            Ok(Incoming::Duplicate) => {}
+            // Подделку, повтор или битое сообщение подтверждаем, чтобы релей перестал его слать.
+            Err(e) if messaging::is_message_error(&e) => {
                 eprintln!(
                     "! отброшено сообщение, якобы от {}: {e:#}",
                     display::contact_name(&contact)
                 );
             }
+            // А вот ошибку базы — нет: сообщение придёт снова.
+            Err(e) => return Err(e),
         }
 
         self.conn

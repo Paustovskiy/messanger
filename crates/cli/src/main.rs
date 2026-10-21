@@ -1,20 +1,20 @@
 //! `messenger` — консольный клиент.
 
 mod display;
+mod messaging;
 mod relay_client;
 mod session;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use crypto_core::{Identity, envelope_id, verify_contact_card};
+use messaging::Incoming;
 use protocol::{ContactCardV2, Envelope, EnvelopeB64, normalize_username};
 use session::{Session, Step};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use storage::{
-    ContactRow, Db, DeliveryStatus, Direction, IdentityRow, NewMessage, PendingOutgoing,
-};
+use storage::{ContactRow, Db, DeliveryStatus, Direction, IdentityRow, PendingOutgoing};
 
 /// Сколько ждать, пока релей примет сообщение.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -109,11 +109,12 @@ enum Command {
     /// Быть онлайн: получать сообщения, дослать исходящие, переподключаться при обрыве.
     Listen,
 
-    /// Дослать сообщения, которые ещё не доставлены.
-    RetryOutbox {
+    /// Подключиться один раз: забрать всё, что ждёт на релее, дослать исходящие и выйти.
+    #[command(alias = "retry-outbox")]
+    Sync {
         #[arg(long, default_value_t = 100)]
         limit: usize,
-        /// Сколько секунд ждать подтверждений доставки.
+        /// Сколько секунд ждать подтверждений доставки исходящих.
         #[arg(long, default_value_t = 3)]
         wait: u64,
     },
@@ -165,7 +166,7 @@ fn main() -> Result<()> {
             envelope_file,
         } => cmd_receive(&db, envelope, envelope_file),
         Command::Listen => cmd_listen(&db, &cli.relay),
-        Command::RetryOutbox { limit, wait } => cmd_retry_outbox(&db, &cli.relay, limit, wait),
+        Command::Sync { limit, wait } => cmd_sync(&db, &cli.relay, limit, wait),
         Command::Chat { with, limit } => cmd_chat(&db, &with, limit),
         Command::Threads { limit } => cmd_threads(&db, limit),
     }
@@ -218,6 +219,7 @@ fn cmd_init(db: &Db, cli: &Cli) -> Result<()> {
         sign_secret: Some(id.sign_secret_bytes()),
         sign_public: Some(id.sign_public_bytes()),
     })?;
+    messaging::ensure_signed_prekey(db, &id)?;
     println!("Создана новая личность для профиля `{}`.", cli.profile);
     println!("account_id: {account_id}");
     println!("отпечаток:  {}", id.fingerprint());
@@ -248,7 +250,11 @@ fn cmd_set_username(db: &Db, username: &str) -> Result<()> {
 
 fn cmd_export_contact(db: &Db, out: Option<PathBuf>) -> Result<()> {
     let (row, id) = load_identity(db)?;
-    let json = serde_json::to_string_pretty(&id.contact_card(row.username))?;
+    let mut card = id.contact_card(row.username);
+    // Свежий предключ в карточке позволяет начать переписку даже без релея.
+    let (spk, _) = messaging::ensure_signed_prekey(db, &id)?;
+    card.signed_prekey = Some(messaging::signed_prekey_wire(&spk));
+    let json = serde_json::to_string_pretty(&card)?;
     match out {
         Some(path) => {
             std::fs::write(&path, format!("{json}\n"))
@@ -285,11 +291,18 @@ fn cmd_add_contact(db: &Db, contact: Option<String>, file: Option<PathBuf>) -> R
         }
     }
 
+    let signed_prekey = card
+        .signed_prekey
+        .as_ref()
+        .map(|k| messaging::verified_card_prekey(&v.ed25519_pub, k))
+        .transpose()?;
+
     db.upsert_contact(&ContactRow {
         account_id: v.account_id.clone(),
         username: v.username.clone(),
         public: v.x25519_pub,
         sign_public: Some(v.ed25519_pub),
+        signed_prekey,
     })?;
 
     println!(
@@ -322,6 +335,7 @@ fn cmd_list_contacts(db: &Db) -> Result<()> {
 fn cmd_remove_contact(db: &Db, who: &str) -> Result<()> {
     let c = find_contact(db, who)?;
     db.delete_contact(&c.account_id)?;
+    db.delete_sessions(&c.account_id)?;
     println!("Удалён контакт {}", display::contact_name(&c));
     Ok(())
 }
@@ -338,26 +352,13 @@ fn find_contact(db: &Db, who: &str) -> Result<ContactRow> {
 fn cmd_send(db: &Db, relay: &str, to: &str, text: &str, offline: bool, wait: u64) -> Result<()> {
     let (_, me) = load_identity(db)?;
     let contact = find_contact(db, to)?;
+    messaging::peer_keys(&contact)?;
     if text.trim().is_empty() {
         bail!("пустое сообщение");
     }
 
-    let env = me.encrypt_to(&contact.account_id, &contact.public, text.as_bytes())?;
-    let msg_id = envelope_id(&env);
-    let wire = EnvelopeB64::from(&env);
-    let envelope_json = serde_json::to_string(&wire)?;
-
-    // Сначала сохраняем — сообщение не потеряется, даже если сеть недоступна.
-    db.insert_message(&NewMessage {
-        direction: Direction::Out,
-        peer_account_id: &contact.account_id,
-        peer_username: contact.username.as_deref(),
-        plaintext: text,
-        envelope_json: &envelope_json,
-        msg_id: &msg_id,
-    })?;
-
     if offline {
+        let (wire, _) = messaging::seal_and_store(db, &me, &contact, None, text)?;
         println!("{}", serde_json::to_string_pretty(&wire)?);
         eprintln!(
             "Передайте этот конверт собеседнику ({}) — он откроет его командой `messenger receive`.",
@@ -366,17 +367,47 @@ fn cmd_send(db: &Db, relay: &str, to: &str, text: &str, offline: bool, wait: u64
         return Ok(());
     }
 
-    let pending = PendingOutgoing {
-        peer_account_id: contact.account_id.clone(),
-        msg_id: msg_id.clone(),
-        envelope_json,
-    };
+    const SAVED: &str = "релей недоступен; сообщение сохранено в исходящих и уйдёт при \
+                         `messenger listen` или `messenger sync`";
 
     runtime()?.block_on(async {
-        let mut s = Session::open(relay, db, &me).await.context(
-            "релей недоступен; сообщение сохранено в исходящих и уйдёт при \
-             `messenger listen` или `messenger retry-outbox`",
-        )?;
+        // Если сессия уже есть — шифруем и сохраняем до похода в сеть,
+        // чтобы сообщение не потерялось, даже если релей недоступен.
+        let mut sealed = if messaging::can_send_now(db, &contact.account_id)? {
+            Some(messaging::seal_and_store(db, &me, &contact, None, text)?)
+        } else {
+            None
+        };
+
+        let mut s = match Session::open(relay, db, &me).await {
+            Ok(s) => s,
+            Err(e) if sealed.is_some() => return Err(e.context(SAVED)),
+            // Сессии нет, релея нет — выручит предключ из карточки, если он есть.
+            Err(e) if contact.signed_prekey.is_some() => {
+                messaging::seal_and_store(db, &me, &contact, None, text)?;
+                return Err(e.context(SAVED));
+            }
+            Err(e) => {
+                return Err(e.context(
+                    "релей недоступен, а сессии с собеседником ещё нет — сообщение не отправлено",
+                ));
+            }
+        };
+
+        if sealed.is_none() {
+            // Первое сообщение: берём у релея свежие предключи собеседника.
+            let peer = contact.account_id.clone();
+            s.fetch_bundle(&peer).await?;
+            wait_for(&mut s, ACCEPT_TIMEOUT, |s| s.bundles.contains_key(&peer)).await?;
+            let bundle = s.bundles.get(&peer).cloned().flatten();
+            sealed = Some(messaging::seal_and_store(db, &me, &contact, bundle, text)?);
+        }
+        let (wire, msg_id) = sealed.expect("sealed above");
+        let pending = PendingOutgoing {
+            peer_account_id: contact.account_id.clone(),
+            msg_id: msg_id.clone(),
+            envelope_json: serde_json::to_string(&wire)?,
+        };
         s.send_pending(&pending).await?;
 
         let ids = [msg_id.clone()];
@@ -414,27 +445,12 @@ fn cmd_receive(db: &Db, envelope: Option<String>, file: Option<PathBuf>) -> Resu
             env.from
         )
     })?;
-    let sign_pub = contact.sign_public.context(
-        "контакт добавлен старой версией без ключа подписи; добавьте его карточку заново",
-    )?;
 
-    let plaintext = me
-        .decrypt(&env, &sign_pub)
-        .context("не удалось открыть сообщение")?;
-    let text = String::from_utf8_lossy(&plaintext);
-
-    let inserted = db.insert_message(&NewMessage {
-        direction: Direction::In,
-        peer_account_id: &contact.account_id,
-        peer_username: contact.username.as_deref(),
-        plaintext: &text,
-        envelope_json: &serde_json::to_string(&wire)?,
-        msg_id: &envelope_id(&env),
-    })?;
-
-    println!("{}: {}", display::contact_name(&contact), text);
-    if inserted.is_none() {
-        eprintln!("(это сообщение уже было получено раньше)");
+    match messaging::open_and_store(db, &me, &contact, &wire, &envelope_id(&env))
+        .context("не удалось открыть сообщение")?
+    {
+        Incoming::New(text) => println!("{}: {}", display::contact_name(&contact), text),
+        Incoming::Duplicate => eprintln!("(это сообщение уже было получено раньше)"),
     }
     Ok(())
 }
@@ -492,13 +508,9 @@ fn cmd_listen(db: &Db, relay: &str) -> Result<()> {
     })
 }
 
-fn cmd_retry_outbox(db: &Db, relay: &str, limit: usize, wait: u64) -> Result<()> {
+fn cmd_sync(db: &Db, relay: &str, limit: usize, wait: u64) -> Result<()> {
     let (_, me) = load_identity(db)?;
     let pending = db.list_pending_outgoing(limit)?;
-    if pending.is_empty() {
-        println!("Исходящие пусты — всё доставлено.");
-        return Ok(());
-    }
 
     runtime()?.block_on(async {
         let mut s = Session::open(relay, db, &me).await?;
@@ -507,19 +519,23 @@ fn cmd_retry_outbox(db: &Db, relay: &str, limit: usize, wait: u64) -> Result<()>
         }
         let ids: Vec<String> = pending.iter().map(|p| p.msg_id.clone()).collect();
 
-        wait_for(&mut s, ACCEPT_TIMEOUT, |s| all_settled(s, &ids)).await?;
-        wait_for(&mut s, Duration::from_secs(wait), |s| {
-            ids.iter().all(|id| s.delivered.contains(id) || s.rejected.contains_key(id))
-        })
-        .await?;
-
-        let accepted = ids.iter().filter(|id| s.accepted.contains(*id)).count();
-        let delivered = ids.iter().filter(|id| s.delivered.contains(*id)).count();
-        let rejected = ids.iter().filter(|id| s.rejected.contains_key(*id)).count();
-        println!(
-            "Исходящих: {} — принято релеем {accepted}, доставлено {delivered}, отклонено {rejected}.",
-            ids.len()
-        );
+        // Входящие: релей выдаёт очередь сразу после входа и отмечает её конец.
+        wait_for(&mut s, ACCEPT_TIMEOUT, |s| s.synced && all_settled(s, &ids)).await?;
+        if ids.is_empty() {
+            println!("Исходящие пусты — всё доставлено.");
+        } else {
+            wait_for(&mut s, Duration::from_secs(wait), |s| {
+                ids.iter().all(|id| s.delivered.contains(id) || s.rejected.contains_key(id))
+            })
+            .await?;
+            let accepted = ids.iter().filter(|id| s.accepted.contains(*id)).count();
+            let delivered = ids.iter().filter(|id| s.delivered.contains(*id)).count();
+            let rejected = ids.iter().filter(|id| s.rejected.contains_key(*id)).count();
+            println!(
+                "Исходящих: {} — принято релеем {accepted}, доставлено {delivered}, отклонено {rejected}.",
+                ids.len()
+            );
+        }
         s.close().await;
         Ok(())
     })
@@ -571,6 +587,7 @@ fn cmd_chat(db: &Db, with: &str, limit: usize) -> Result<()> {
                 match m.status {
                     DeliveryStatus::Delivered => " ✓✓",
                     DeliveryStatus::Pending => " ✓",
+                    DeliveryStatus::Failed => " ✗",
                 },
             ),
         };
@@ -601,6 +618,7 @@ fn cmd_threads(db: &Db, limit: usize) -> Result<()> {
             (Direction::In, _) => "",
             (Direction::Out, DeliveryStatus::Delivered) => "я ✓✓: ",
             (Direction::Out, DeliveryStatus::Pending) => "я ✓: ",
+            (Direction::Out, DeliveryStatus::Failed) => "я ✗: ",
         };
         println!(
             "[{}] {who}{unread} — {prefix}{}",

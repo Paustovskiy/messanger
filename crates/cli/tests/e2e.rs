@@ -171,11 +171,11 @@ fn alice_and_bob_chat_through_the_relay() {
     let _ = listen.wait();
 
     // Подтверждение первого сообщения пришло, пока Алиса была офлайн, — заберём его.
-    alice.ok(&["retry-outbox", "--wait", "1"]);
+    alice.ok(&["sync", "--wait", "1"]);
     let chat = alice.ok(&["chat", "@bobby"]);
     assert!(chat.contains("я ✓✓: Привет, Боб! 🚀"), "{chat}");
     assert!(chat.contains("я ✓✓: ты онлайн?"), "{chat}");
-    assert!(alice.ok(&["retry-outbox"]).contains("Исходящие пусты"));
+    assert!(alice.ok(&["sync"]).contains("Исходящие пусты"));
 
     // У Боба два непрочитанных; после просмотра чата — ноль.
     assert!(bob.ok(&["threads"]).contains("@alice (2 новых)"));
@@ -238,6 +238,102 @@ fn offline_envelope_exchange_without_relay() {
     let out = alice.run(&["send", &bob_id, "позже"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("сохранено в исходящих"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `listen` и `send` одного пользователя работают одновременно с одной базой,
+/// а собеседник пишет встречно. Состояние храповика не должно разъехаться.
+#[test]
+fn listen_and_send_in_parallel_keep_sessions_consistent() {
+    let dir = tmp_dir("parallel");
+    let relay = start_relay();
+    let alice = User::new(&dir, "alice", &relay);
+    let bob = User::new(&dir, "bob", &relay);
+    for (u, name) in [(&alice, "alice"), (&bob, "bobby")] {
+        u.ok(&["init"]);
+        u.ok(&["set-username", name]);
+    }
+    alice.ok(&["add-contact", "--contact", &bob.ok(&["export-contact"])]);
+    bob.ok(&["add-contact", "--contact", &alice.ok(&["export-contact"])]);
+
+    // Боб в сети: публикует предключи и принимает сообщения.
+    let mut listen = bob
+        .cmd(&["listen"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (line_tx, line_rx) = mpsc::channel();
+    let stdout = listen.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = line_tx.send(line);
+        }
+    });
+    let ready = line_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(ready.starts_with("В сети"), "{ready}");
+
+    // Встречная переписка: Алиса пишет, а Боб из другого процесса отвечает,
+    // пока его `listen` в это же время принимает её сообщения.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for i in 0..5 {
+                alice.ok(&["send", "@bobby", &format!("от Алисы {i}"), "--wait", "0"]);
+            }
+        });
+        scope.spawn(|| {
+            for i in 0..5 {
+                bob.ok(&["send", "@alice", &format!("от Боба {i}"), "--wait", "0"]);
+            }
+        });
+    });
+
+    // Сообщения Алисы мог принять любой процесс Боба (`listen` или `send`) —
+    // проверяем, что все они оказались в его базе ровно по одному разу.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let chat = loop {
+        let chat = bob.ok(&["chat", "@alice"]);
+        if (0..5).all(|i| chat.contains(&format!("@alice: от Алисы {i}\n"))) {
+            break chat;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bob is missing messages:\n{chat}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(chat.matches("@alice: от Алисы").count(), 5, "{chat}");
+
+    listen.kill().unwrap();
+    let _ = listen.wait();
+
+    // Алиса забирает ответы Боба (и подтверждения).
+    alice.ok(&["sync", "--wait", "1"]);
+    let chat = alice.ok(&["chat", "@bobby"]);
+    for i in 0..5 {
+        assert!(chat.contains(&format!("@bobby: от Боба {i}")), "{chat}");
+    }
+
+    // После всего этого сессии живы: переписка продолжается в обе стороны.
+    let mut listen = bob
+        .cmd(&["listen"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    // Короткий `send` Боба подключается и отключается, пока `listen` работает…
+    bob.ok(&["send", "@alice", "пока слушаю", "--wait", "0"]);
+    // …и `listen` после этого всё равно получает сообщения вживую.
+    let sent = alice.ok(&["send", "@bobby", "финал", "--wait", "2"]);
+    assert!(sent.contains("✓✓ доставлено @bobby: «финал»"), "{sent}");
+    listen.kill().unwrap();
+    let _ = listen.wait();
+    assert!(bob.ok(&["chat", "@alice"]).contains("@alice: финал"));
+    bob.ok(&["send", "@alice", "и тебе", "--wait", "0"]);
+    alice.ok(&["sync", "--wait", "1"]);
+    assert!(alice.ok(&["chat", "@bobby"]).contains("@bobby: и тебе"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

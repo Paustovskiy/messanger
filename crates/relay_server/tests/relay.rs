@@ -1,11 +1,13 @@
 //! Интеграционные тесты: настоящий релей на случайном порту + WebSocket-клиенты.
 
-use crypto_core::Identity;
+use crypto_core::{Bundle, Identity, PeerKeys, PrekeySecrets, SessionSet};
 use futures_util::{SinkExt, StreamExt};
-use protocol::{ClientMessage, EnvelopeB64, ServerMessage, b64, decode_fixed};
+use protocol::{ClientMessage, EnvelopeB64, ServerMessage, SignedPrekey, b64, decode_fixed};
 use relay_server::{Config, Relay};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -53,6 +55,40 @@ impl Server {
 struct Client {
     ws: Ws,
     id: Identity,
+    sessions: HashMap<String, SessionSet>,
+}
+
+/// Подписанный предключ каждого тестового участника (по ключу подписи —
+/// имена вроде "alice" повторяются в параллельных тестах).
+type PrekeyRegistry = Mutex<HashMap<[u8; 32], ([u8; 32], SignedPrekey)>>;
+
+fn prekey_of(id: &Identity) -> ([u8; 32], SignedPrekey) {
+    static KEYS: OnceLock<PrekeyRegistry> = OnceLock::new();
+    *KEYS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(id.sign_public_bytes())
+        .or_insert_with(|| id.new_signed_prekey(1))
+}
+
+fn keys_of(id: &Identity) -> PeerKeys {
+    PeerKeys {
+        account_id: id.account_id().into(),
+        x25519_pub: id.x_public_bytes(),
+        ed25519_pub: id.sign_public_bytes(),
+    }
+}
+
+/// Конверт от `from` к `to` (через свежую сессию).
+fn make_envelope(from: &Identity, to: &Identity, text: &str) -> EnvelopeB64 {
+    let mut set = SessionSet::default();
+    let bundle = Bundle {
+        signed_prekey: prekey_of(to).1,
+        one_time: None,
+    };
+    from.start_session(&keys_of(to), &bundle, &mut set).unwrap();
+    EnvelopeB64::from(&from.seal(&keys_of(to), &mut set, text.as_bytes()).unwrap())
 }
 
 impl Client {
@@ -62,10 +98,7 @@ impl Client {
 
     /// Подключиться и пройти вход.
     async fn connect(url: &str, id: &Identity) -> Client {
-        let mut c = Client {
-            ws: Self::raw(url).await,
-            id: id.clone(),
-        };
+        let mut c = Client::unauthenticated(url, id).await;
         let nonce = c.challenge().await;
         c.auth_with(&nonce, id).await;
         match c.recv().await {
@@ -73,6 +106,14 @@ impl Client {
             other => panic!("expected Authenticated, got {other:?}"),
         }
         c
+    }
+
+    async fn unauthenticated(url: &str, id: &Identity) -> Client {
+        Client {
+            ws: Self::raw(url).await,
+            id: id.clone(),
+            sessions: HashMap::new(),
+        }
     }
 
     async fn challenge(&mut self) -> [u8; 32] {
@@ -102,7 +143,17 @@ impl Client {
             .unwrap();
     }
 
+    /// Следующее сообщение, кроме служебного `PrekeyStatus`.
     async fn recv(&mut self) -> ServerMessage {
+        loop {
+            match self.recv_any().await {
+                ServerMessage::PrekeyStatus { .. } => continue,
+                other => return other,
+            }
+        }
+    }
+
+    async fn recv_any(&mut self) -> ServerMessage {
         loop {
             let msg = tokio::time::timeout(Duration::from_secs(3), self.ws.next())
                 .await
@@ -115,20 +166,28 @@ impl Client {
         }
     }
 
+    /// Убедиться, что релей ничего не присылает (служебный статус не в счёт).
     async fn expect_silence(&mut self) {
-        if let Ok(Some(Ok(Message::Text(t)))) =
-            tokio::time::timeout(Duration::from_millis(300), self.ws.next()).await
-        {
-            panic!("expected no messages, got {t}");
+        let until = tokio::time::Instant::now() + Duration::from_millis(300);
+        while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(until, self.ws.next()).await {
+            if let Message::Text(t) = msg {
+                if !t.contains(r#""type":"prekey_status""#) {
+                    panic!("expected no messages, got {t}");
+                }
+            }
         }
     }
 
-    fn envelope(&self, to: &Identity, text: &str) -> EnvelopeB64 {
-        let env = self
-            .id
-            .encrypt_to(to.account_id(), &to.x_public_bytes(), text.as_bytes())
-            .unwrap();
-        EnvelopeB64::from(&env)
+    fn envelope(&mut self, to: &Identity, text: &str) -> EnvelopeB64 {
+        let set = self.sessions.entry(to.account_id().into()).or_default();
+        if set.is_empty() {
+            let bundle = Bundle {
+                signed_prekey: prekey_of(to).1,
+                one_time: None,
+            };
+            self.id.start_session(&keys_of(to), &bundle, set).unwrap();
+        }
+        EnvelopeB64::from(&self.id.seal(&keys_of(to), set, text.as_bytes()).unwrap())
     }
 
     async fn send_text(&mut self, to: &Identity, msg_id: &str, text: &str) -> ServerMessage {
@@ -152,8 +211,13 @@ impl Client {
             } => {
                 assert_eq!(f, from.account_id());
                 let env = protocol::Envelope::try_from(envelope).unwrap();
-                let pt = self.id.decrypt(&env, &from.sign_public_bytes()).unwrap();
-                (msg_id, String::from_utf8(pt).unwrap())
+                let secrets = PrekeySecrets {
+                    signed_prekey: Some(prekey_of(&self.id).0),
+                    ..Default::default()
+                };
+                let set = self.sessions.entry(from.account_id().into()).or_default();
+                let opened = self.id.open(&keys_of(from), set, &env, &secrets).unwrap();
+                (msg_id, String::from_utf8(opened.plaintext).unwrap())
             }
             other => panic!("expected Deliver, got {other:?}"),
         }
@@ -283,10 +347,7 @@ async fn impersonation_is_rejected() {
 
     // Мэллори пытается войти как "alice" со своим ключом.
     let mallory_as_alice = Identity::generate("alice");
-    let mut m = Client {
-        ws: Client::raw(&server.url()).await,
-        id: mallory_as_alice.clone(),
-    };
+    let mut m = Client::unauthenticated(&server.url(), &mallory_as_alice).await;
     let nonce = m.challenge().await;
     m.auth_with(&nonce, &mallory_as_alice).await;
     assert!(
@@ -294,10 +355,7 @@ async fn impersonation_is_rejected() {
     );
 
     // Подпись не того nonce.
-    let mut m = Client {
-        ws: Client::raw(&server.url()).await,
-        id: alice.clone(),
-    };
+    let mut m = Client::unauthenticated(&server.url(), &alice).await;
     let _ = m.challenge().await;
     m.auth_with(&[0u8; 32], &alice).await;
     assert!(
@@ -318,10 +376,7 @@ async fn key_derived_ids_cannot_be_squatted() {
         Identity::generate_new().x_secret_bytes(),
         Identity::generate_new().sign_secret_bytes(),
     );
-    let mut m = Client {
-        ws: Client::raw(&server.url()).await,
-        id: squatter.clone(),
-    };
+    let mut m = Client::unauthenticated(&server.url(), &squatter).await;
     let nonce = m.challenge().await;
     m.auth_with(&nonce, &squatter).await;
     assert!(
@@ -337,10 +392,7 @@ async fn key_derived_ids_cannot_be_squatted() {
 async fn nothing_works_before_auth() {
     let server = Server::start(Config::default()).await;
     let (alice, bob) = (Identity::generate("alice"), Identity::generate("bob"));
-    let mut c = Client {
-        ws: Client::raw(&server.url()).await,
-        id: alice.clone(),
-    };
+    let mut c = Client::unauthenticated(&server.url(), &alice).await;
     let _ = c.challenge().await;
     let envelope = c.envelope(&bob, "x");
     c.send(ClientMessage::Send {
@@ -362,10 +414,7 @@ async fn auth_times_out() {
         ..Config::default()
     })
     .await;
-    let mut c = Client {
-        ws: Client::raw(&server.url()).await,
-        id: Identity::generate("x"),
-    };
+    let mut c = Client::unauthenticated(&server.url(), &Identity::generate("x")).await;
     let _ = c.challenge().await;
     assert!(
         matches!(c.recv().await, ServerMessage::Error { message, .. } if message.contains("timeout"))
@@ -386,11 +435,7 @@ async fn forged_or_mismatched_envelopes_are_rejected() {
 
     // Конверт, подписанный не Алисой.
     let impostor = Identity::generate("alice");
-    let forged = EnvelopeB64::from(
-        &impostor
-            .encrypt_to("bob", &bob.x_public_bytes(), b"x")
-            .unwrap(),
-    );
+    let forged = make_envelope(&impostor, &bob, "x");
     a.send(ClientMessage::Send {
         to: "bob".into(),
         msg_id: "f1".into(),
@@ -477,6 +522,10 @@ async fn live_connections_survive_pings() {
     .await;
     let (alice, bob) = (Identity::generate("alice"), Identity::generate("bob"));
     let mut b = Client::connect(&server.url(), &bob).await;
+    assert!(matches!(
+        b.recv_any().await,
+        ServerMessage::PrekeyStatus { .. }
+    ));
     // Боб «слушает» дольше трёх интервалов пинга: читает сокет и тем самым отвечает на пинги.
     let until = tokio::time::Instant::now() + Duration::from_millis(600);
     while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(until, b.ws.next()).await {
@@ -488,6 +537,37 @@ async fn live_connections_survive_pings() {
     let mut a = Client::connect(&server.url(), &alice).await;
     accepted(&a.send_text(&bob, "m1", "всё ещё тут").await, "m1");
     assert_eq!(b.recv_text(&alice).await.1, "всё ещё тут");
+    server.stop().await;
+}
+
+/// Регрессия: `listen` и `send` одного пользователя подключены одновременно.
+/// Раньше второе соединение вытесняло первое, а после его закрытия релей
+/// забывал и про первое — сообщения переставали доходить до `listen`.
+#[tokio::test]
+async fn several_connections_of_one_account_all_receive() {
+    let server = Server::start(Config::default()).await;
+    let (alice, bob) = (Identity::generate("alice"), Identity::generate("bob"));
+    let mut listen = Client::connect(&server.url(), &bob).await;
+    let mut a = Client::connect(&server.url(), &alice).await;
+
+    {
+        let mut send = Client::connect(&server.url(), &bob).await;
+        accepted(&a.send_text(&bob, "m1", "обоим").await, "m1");
+        assert_eq!(listen.recv_text(&alice).await.1, "обоим");
+        assert_eq!(send.recv_text(&alice).await.1, "обоим");
+        send.ack(&alice, "m1").await;
+        assert_eq!(
+            a.recv().await,
+            ServerMessage::DeliverAck {
+                from: "bob".into(),
+                msg_id: "m1".into()
+            }
+        );
+    }
+    // Второе соединение закрылось — первое по-прежнему получает.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    accepted(&a.send_text(&bob, "m2", "только listen").await, "m2");
+    assert_eq!(listen.recv_text(&alice).await.1, "только listen");
     server.stop().await;
 }
 
@@ -532,13 +612,139 @@ async fn queue_and_key_bindings_survive_restart() {
 
     // И ключ Алисы всё ещё закреплён.
     let impostor = Identity::generate("alice");
-    let mut m = Client {
-        ws: Client::raw(&server.url()).await,
-        id: impostor.clone(),
-    };
+    let mut m = Client::unauthenticated(&server.url(), &impostor).await;
     let nonce = m.challenge().await;
     m.auth_with(&nonce, &impostor).await;
     assert!(matches!(m.recv().await, ServerMessage::Error { .. }));
     server.stop().await;
     let _ = std::fs::remove_dir_all(db.parent().unwrap());
+}
+
+fn publish(id: &Identity, spk_id: u32, opk_ids: std::ops::Range<u32>) -> ClientMessage {
+    let (_, spk) = id.new_signed_prekey(spk_id);
+    ClientMessage::PublishPrekeys {
+        signed_prekey: (&spk).into(),
+        one_time: opk_ids
+            .map(|i| (&crypto_core::new_one_time_prekey(i).1).into())
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn prekeys_are_published_and_handed_out_once() {
+    let server = Server::start(Config::default()).await;
+    let (alice, bob) = (Identity::generate("alice"), Identity::generate("bob"));
+    let mut b = Client::connect(&server.url(), &bob).await;
+    let mut a = Client::connect(&server.url(), &alice).await;
+
+    // Пока Боб ничего не публиковал — пустой набор.
+    a.send(ClientMessage::FetchBundle {
+        account_id: "bob".into(),
+    })
+    .await;
+    assert_eq!(
+        a.recv().await,
+        ServerMessage::Bundle {
+            account_id: "bob".into(),
+            signed_prekey: None,
+            one_time: None
+        }
+    );
+
+    // Статус сразу после входа: ничего не опубликовано.
+    assert_eq!(
+        b.recv_any().await,
+        ServerMessage::PrekeyStatus {
+            has_signed_prekey: false,
+            one_time_left: 0
+        }
+    );
+    b.send(publish(&bob, 1, 1..3)).await;
+    assert_eq!(
+        b.recv_any().await,
+        ServerMessage::PrekeyStatus {
+            has_signed_prekey: true,
+            one_time_left: 2
+        }
+    );
+
+    let mut handed_out = vec![];
+    for _ in 0..3 {
+        a.send(ClientMessage::FetchBundle {
+            account_id: "bob".into(),
+        })
+        .await;
+        match a.recv().await {
+            ServerMessage::Bundle {
+                signed_prekey: Some(spk),
+                one_time,
+                ..
+            } => {
+                let spk = SignedPrekey::try_from(&spk).unwrap();
+                crypto_core::verify_signed_prekey(&bob.sign_public_bytes(), &spk).unwrap();
+                handed_out.push(one_time.map(|k| k.id));
+            }
+            other => panic!("expected bundle, got {other:?}"),
+        }
+    }
+    // Каждый одноразовый ключ выдан ровно один раз, дальше — только подписанный.
+    assert_eq!(handed_out, [Some(1), Some(2), None]);
+
+    // При следующем входе Боб узнаёт, что запас кончился.
+    drop(b);
+    let mut b = Client::unauthenticated(&server.url(), &bob).await;
+    let nonce = b.challenge().await;
+    b.auth_with(&nonce, &bob).await;
+    assert!(matches!(
+        b.recv().await,
+        ServerMessage::Authenticated { .. }
+    ));
+    assert_eq!(
+        b.recv_any().await,
+        ServerMessage::PrekeyStatus {
+            has_signed_prekey: true,
+            one_time_left: 0
+        }
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn foreign_or_oversized_prekey_uploads_are_rejected() {
+    let server = Server::start(Config {
+        max_one_time_prekeys: 3,
+        ..Config::default()
+    })
+    .await;
+    let bob = Identity::generate("bob");
+    let mallory = Identity::generate("mallory");
+    let mut b = Client::connect(&server.url(), &bob).await;
+
+    // Предключ, подписанный чужим ключом.
+    b.send(publish(&mallory, 1, 0..0)).await;
+    assert!(
+        matches!(b.recv().await, ServerMessage::Error { message, .. } if message.contains("not signed"))
+    );
+
+    // Слишком много за раз.
+    b.send(publish(
+        &bob,
+        1,
+        0..(protocol::MAX_ONE_TIME_PREKEYS_PER_UPLOAD as u32 + 1),
+    ))
+    .await;
+    assert!(
+        matches!(b.recv().await, ServerMessage::Error { message, .. } if message.contains("too many"))
+    );
+
+    // Сверх лимита релей просто не хранит.
+    b.send(publish(&bob, 1, 0..10)).await;
+    assert_eq!(
+        b.recv_any().await,
+        ServerMessage::PrekeyStatus {
+            has_signed_prekey: true,
+            one_time_left: 3
+        }
+    );
+    server.stop().await;
 }

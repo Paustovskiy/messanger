@@ -1,35 +1,29 @@
 //! Криптография мессенджера.
 //!
-//! У каждого аккаунта две пары ключей:
-//! * **X25519** — чтобы ему можно было что-то зашифровать;
-//! * **Ed25519** — чтобы подписывать карточку контакта, сообщения и вход на релей.
+//! У каждого аккаунта две постоянные пары ключей:
+//! * **X25519** (identity key) — участвует в X3DH при знакомстве;
+//! * **Ed25519** — подписывает карточку контакта, предключи, сообщения и вход на релей.
 //!
-//! Шифрование сообщения (по сути ECIES + подпись):
-//! 1. отправитель генерирует одноразовую X25519-пару и делает DH с постоянным
-//!    X25519-ключом получателя;
-//! 2. из общего секрета через HKDF-SHA256 выводится ключ ChaCha20-Poly1305
-//!    (в `info` входят оба публичных ключа);
-//! 3. заголовок (`from`, `to`, `eph_pub`) идёт в AEAD как associated data;
-//! 4. весь конверт подписывается Ed25519-ключом отправителя.
-//!
-//! Чего здесь пока **нет** (см. README): forward secrecy для получателя
-//! (Double Ratchet / X3DH) и защиты от повторной отправки старого конверта —
-//! последнее закрывается на уровне приложения уникальным `msg_id`.
+//! Сами сообщения шифруются в сессиях: X3DH даёт общий секрет, Double Ratchet
+//! выводит из него новый ключ на каждое сообщение (см. модули [`session`] и
+//! [`ratchet`]). Поверх этого каждый конверт подписан отправителем, чтобы релей
+//! мог отсеивать подделки, не умея ничего расшифровать.
 
-use chacha20poly1305::{
-    ChaCha20Poly1305, Key, Nonce,
-    aead::{Aead, KeyInit, Payload},
+pub mod ratchet;
+pub mod session;
+
+pub use session::{
+    Bundle, Opened, PeerKeys, PrekeySecrets, SessionSet, new_one_time_prekey, verify_signed_prekey,
 };
+
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use hkdf::Hkdf;
 use protocol::{ContactCardPayload, ContactCardV2, Envelope, MAX_PLAINTEXT_LEN, ProtocolError};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey, StaticSecret};
 
-const HKDF_INFO_AEAD: &[u8] = b"messenger/aead/v1";
 const FINGERPRINT_DOMAIN: &[u8] = b"messenger/fingerprint/v1";
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -46,6 +40,16 @@ pub enum CryptoError {
     DecryptFailed,
     #[error("account_id does not match the signing key")]
     AccountIdMismatch,
+    #[error("no session with this contact yet")]
+    NoSession,
+    #[error("message refers to a prekey we don't have (already used or expired)")]
+    UnknownPrekey,
+    #[error("this first message was already processed (replay)")]
+    Replay,
+    #[error("message is too far ahead in its chain")]
+    TooManySkipped,
+    #[error("stored session state is corrupted")]
+    CorruptState,
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 }
@@ -150,88 +154,6 @@ impl Identity {
         };
         let sig = self.sign(&payload.signing_bytes());
         ContactCardV2::from_parts(&payload, sig)
-    }
-
-    /// Зашифровать `plaintext` для `to` (его X25519-ключ — `peer_x_pub`)
-    /// и подписать конверт.
-    pub fn encrypt_to(
-        &self,
-        to: &str,
-        peer_x_pub: &[u8; 32],
-        plaintext: &[u8],
-    ) -> Result<Envelope, CryptoError> {
-        if plaintext.len() > MAX_PLAINTEXT_LEN {
-            return Err(CryptoError::MessageTooLarge(plaintext.len()));
-        }
-        protocol::check_id(to, "to")?;
-
-        let peer = PublicKey::from(*peer_x_pub);
-        let eph_secret = EphemeralSecret::random_from_rng(OsRng);
-        let eph_pub = PublicKey::from(&eph_secret).to_bytes();
-
-        let shared = eph_secret.diffie_hellman(&peer);
-        if !shared.was_contributory() {
-            return Err(CryptoError::InvalidPeerKey);
-        }
-        let aead = aead_for(shared.as_bytes(), &eph_pub, peer_x_pub);
-
-        let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
-
-        let aad = protocol::envelope_aad(&self.account_id, to, &eph_pub);
-        let body = aead
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad: &aad,
-                },
-            )
-            .expect("ChaCha20-Poly1305 encryption cannot fail for in-memory buffers");
-
-        let sig_bytes =
-            protocol::envelope_signing_bytes(&self.account_id, to, &eph_pub, &nonce, &body);
-        let sig = self.sign(&sig_bytes);
-
-        Ok(Envelope {
-            from: self.account_id.clone(),
-            to: to.to_owned(),
-            eph_pub,
-            nonce,
-            body,
-            sig,
-        })
-    }
-
-    /// Проверить подпись отправителя и расшифровать конверт.
-    ///
-    /// `sender_sign_pub` — Ed25519-ключ отправителя из *нашей* базы контактов,
-    /// а не из самого конверта: иначе подпись ничего бы не доказывала.
-    pub fn decrypt(
-        &self,
-        env: &Envelope,
-        sender_sign_pub: &[u8; 32],
-    ) -> Result<Vec<u8>, CryptoError> {
-        if env.to != self.account_id {
-            return Err(CryptoError::WrongRecipient(env.to.clone()));
-        }
-        verify_envelope(env, sender_sign_pub)?;
-
-        let sender_eph = PublicKey::from(env.eph_pub);
-        let shared = self.x_secret.diffie_hellman(&sender_eph);
-        if !shared.was_contributory() {
-            return Err(CryptoError::InvalidPeerKey);
-        }
-        let aead = aead_for(shared.as_bytes(), &env.eph_pub, &self.x_public_bytes());
-
-        aead.decrypt(
-            Nonce::from_slice(&env.nonce),
-            Payload {
-                msg: &env.body,
-                aad: &env.aad(),
-            },
-        )
-        .map_err(|_| CryptoError::DecryptFailed)
     }
 }
 
@@ -349,17 +271,4 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut out = [0u8; N];
     OsRng.fill_bytes(&mut out);
     out
-}
-
-fn aead_for(shared: &[u8; 32], eph_pub: &[u8; 32], recipient_pub: &[u8; 32]) -> ChaCha20Poly1305 {
-    let mut info = Vec::with_capacity(HKDF_INFO_AEAD.len() + 64);
-    info.extend_from_slice(HKDF_INFO_AEAD);
-    info.extend_from_slice(eph_pub);
-    info.extend_from_slice(recipient_pub);
-
-    let mut key = [0u8; 32];
-    Hkdf::<Sha256>::new(None, shared)
-        .expand(&info, &mut key)
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
-    ChaCha20Poly1305::new(Key::from_slice(&key))
 }
