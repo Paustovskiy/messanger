@@ -1,22 +1,26 @@
 [package]
 name = "cli"
-version = "0.1.0"
-edition = "2024"
+description = "Консольный клиент мессенджера"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "messenger"
+path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
+protocol.workspace = true
+crypto_core.workspace = true
+storage.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+rustls.workspace = true
 
-crypto_core = { path = "../crypto_core" }
-storage = { path = "../storage" }
-protocol = { path = "../protocol" }
-x25519-dalek = "2"
-base64 = "0.22.1"
-chrono = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
-tokio-tungstenite = "0.24"
-futures-util = "0.3"
-url = "2"
-serde = { version = "1.0.228", features = ["derive"] }
+[dev-dependencies]
+relay_server.workspace = true
