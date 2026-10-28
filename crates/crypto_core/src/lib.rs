@@ -17,7 +17,10 @@ pub use session::{
 };
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use protocol::{ContactCardPayload, ContactCardV2, Envelope, MAX_PLAINTEXT_LEN, ProtocolError};
+use protocol::{
+    ContactCardPayload, ContactCardV2, DeviceInfo, DeviceList, Envelope, MAX_PLAINTEXT_LEN,
+    ProtocolError, SignedDeviceListB64,
+};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
@@ -50,14 +53,21 @@ pub enum CryptoError {
     TooManySkipped,
     #[error("stored session state is corrupted")]
     CorruptState,
+    #[error("only the primary device holds the account key")]
+    NotAccountKey,
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 }
 
-/// Локальная личность: `account_id` + обе пары ключей.
+/// Локальная личность **устройства**: аккаунт, номер устройства и его ключи.
+///
+/// На основном устройстве (№1) ключ подписи — это ключ аккаунта: им же
+/// подписываются карточка контакта и список устройств. На остальных устройствах
+/// ключ подписи свой, а ключа аккаунта нет вовсе.
 #[derive(Clone)]
 pub struct Identity {
     account_id: String,
+    device_id: u32,
     x_secret: StaticSecret,
     x_public: PublicKey,
     sign: SigningKey,
@@ -68,6 +78,7 @@ impl std::fmt::Debug for Identity {
         // Секреты в логи не попадают никогда.
         f.debug_struct("Identity")
             .field("account_id", &self.account_id)
+            .field("device_id", &self.device_id)
             .field("fingerprint", &self.fingerprint())
             .finish_non_exhaustive()
     }
@@ -108,14 +119,48 @@ impl Identity {
         let x_public = PublicKey::from(&x_secret);
         Self {
             account_id,
+            device_id: protocol::PRIMARY_DEVICE,
             x_secret,
             x_public,
             sign,
         }
     }
 
+    /// То же устройство, но с другим номером (для дополнительных устройств).
+    pub fn with_device(mut self, device_id: u32) -> Self {
+        self.device_id = device_id;
+        self
+    }
+
     pub fn account_id(&self) -> &str {
         &self.account_id
+    }
+
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+
+    /// Описание этого устройства для списка устройств.
+    pub fn device_info(&self, name: impl Into<String>) -> DeviceInfo {
+        DeviceInfo {
+            device_id: self.device_id,
+            x25519_pub: self.x_public_bytes(),
+            ed25519_pub: self.sign_public_bytes(),
+            name: name.into(),
+        }
+    }
+
+    /// Подписать список устройств. Может только основное устройство: его ключ
+    /// подписи и есть ключ аккаунта.
+    pub fn sign_device_list(&self, list: &DeviceList) -> Result<SignedDeviceListB64, CryptoError> {
+        if list.account_id != self.account_id || list.account_pub != self.sign_public_bytes() {
+            return Err(CryptoError::NotAccountKey);
+        }
+        list.validate()?;
+        Ok(SignedDeviceListB64::from_parts(
+            list,
+            self.sign(&list.signing_bytes()),
+        ))
     }
 
     pub fn x_secret_bytes(&self) -> [u8; 32] {
@@ -155,6 +200,35 @@ impl Identity {
         let sig = self.sign(&payload.signing_bytes());
         ContactCardV2::from_parts(&payload, sig)
     }
+}
+
+/// Проверить подписанный список устройств аккаунта `account_id`.
+///
+/// `known_account_pub` — ключ аккаунта, который мы уже знаем (из карточки
+/// контакта или из прошлого списка). Если он есть, ключ в списке обязан с ним
+/// совпасть. Если нет, ключ проверяется по `account_id` (ID выведен из ключа);
+/// для старых UUID-аккаунтов без известного ключа список не принимается.
+pub fn verify_device_list(
+    wire: &SignedDeviceListB64,
+    account_id: &str,
+    known_account_pub: Option<&[u8; 32]>,
+) -> Result<DeviceList, CryptoError> {
+    let (list, sig) = wire.parts()?;
+    if list.account_id != account_id {
+        return Err(CryptoError::AccountIdMismatch);
+    }
+    match known_account_pub {
+        Some(k) if *k != list.account_pub => return Err(CryptoError::AccountIdMismatch),
+        Some(_) => {}
+        None if is_key_derived_account_id(account_id) => {
+            check_account_id(account_id, &list.account_pub)?
+        }
+        None => return Err(CryptoError::AccountIdMismatch),
+    }
+    if !verify_signature(&list.account_pub, &list.signing_bytes(), &sig) {
+        return Err(CryptoError::BadSignature);
+    }
+    Ok(list)
 }
 
 /// Проверить подпись конверта (без расшифровки). Этим пользуется и релей.

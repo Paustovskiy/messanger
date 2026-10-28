@@ -237,7 +237,7 @@ fn offline_envelope_exchange_without_relay() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("не удалось открыть сообщение"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("нет адресованного этому устройству"));
 
     // Без доступного релея сообщение остаётся в исходящих.
     let out = alice.run(&["send", &bob_id, "позже"]);
@@ -477,6 +477,125 @@ fn unencrypted_profile_and_busy_database() {
     let out = with_passwords(&bob, &["set-password"], None, Some(TEST_PASSWORD));
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(bob.ok(&["whoami"]).contains("account_id"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn field(output: &str, prefix: &str) -> String {
+    output
+        .lines()
+        .find(|l| l.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no {prefix:?} in:\n{output}"))
+        .trim_start_matches(prefix)
+        .trim()
+        .to_string()
+}
+
+/// Боб подключает телефон к своему аккаунту: оба устройства получают
+/// сообщения Алисы, видят отправленное с другого устройства, а отключённый
+/// телефон больше никуда не пускают.
+#[test]
+fn second_device_joins_receives_and_is_unlinked() {
+    let dir = tmp_dir("devices");
+    let relay = start_relay();
+    let alice = User::new(&dir, "alice", &relay);
+    let bob = User::new(&dir, "bob", &relay);
+    let phone = User::new(&dir, "bob-phone", &relay);
+    for (u, name) in [(&alice, "alice"), (&bob, "bobby")] {
+        u.ok(&["init"]);
+        u.ok(&["set-username", name]);
+    }
+    alice.ok(&["add-contact", "--contact", &bob.ok(&["export-contact"])]);
+    bob.ok(&["add-contact", "--contact", &alice.ok(&["export-contact"])]);
+
+    // Шаг 1: новое устройство выдаёт код и показывает свой отпечаток.
+    let out = phone.run(&["link", "--name", "телефон"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let phone_fp = field(&stderr(&out), "Отпечаток этого устройства:");
+    // Пока подключение не завершено, профилем пользоваться нельзя.
+    assert!(stderr(&phone.run(&["whoami"])).contains("ещё не подключено"));
+
+    // Шаг 2: основное устройство видит тот же отпечаток и выдаёт ответ.
+    let response = dir.join("link-response.json");
+    let approved = bob.ok(&[
+        "link-approve",
+        &code,
+        "--yes",
+        "-o",
+        response.to_str().unwrap(),
+    ]);
+    assert_eq!(field(&approved, "отпечаток:"), phone_fp);
+    // Без подтверждения (и без терминала) — отказ.
+    assert!(!bob.run(&["link-approve", &code]).status.success());
+
+    // Шаг 3: телефон становится устройством №2 того же аккаунта.
+    let finished = phone.ok(&["link-finish", "--response-file", response.to_str().unwrap()]);
+    assert!(finished.contains("устройство №2"), "{finished}");
+    let (bob_who, phone_who) = (bob.ok(&["whoami"]), phone.ok(&["whoami"]));
+    for f in ["account_id:", "отпечаток:", "username:"] {
+        assert_eq!(field(&bob_who, f), field(&phone_who, f));
+    }
+    assert!(phone_who.contains("№2 «телефон»"), "{phone_who}");
+    let devices = bob.ok(&["devices"]);
+    assert!(devices.contains("телефон"), "{devices}");
+    // Ответ одноразовый: повторно подключиться с ним нельзя.
+    assert!(
+        !phone
+            .run(&["link-finish", "--response-file", response.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    // Телефон выходит в сеть и публикует предключи.
+    phone.ok(&["sync"]);
+
+    // Алиса пишет — сообщение уходит на оба устройства Боба.
+    let sent = alice.ok(&["send", "@bobby", "всем твоим устройствам", "--wait", "0"]);
+    assert!(sent.contains("отправлено: @bobby (устройств: 2)"), "{sent}");
+    bob.ok(&["sync"]);
+    phone.ok(&["sync"]);
+    for u in [&bob, &phone] {
+        let chat = u.ok(&["chat", "@alice"]);
+        assert!(chat.contains("@alice: всем твоим устройствам"), "{chat}");
+    }
+
+    // Телефон отвечает; ноутбук Боба видит отправленное с телефона.
+    phone.ok(&["send", "@alice", "пишу с телефона", "--wait", "0"]);
+    alice.ok(&["sync"]);
+    assert!(
+        alice
+            .ok(&["chat", "@bobby"])
+            .contains("@bobby: пишу с телефона")
+    );
+    bob.ok(&["sync"]);
+    let chat = bob.ok(&["chat", "@alice"]);
+    assert!(chat.contains("я ✓: пишу с телефона"), "{chat}");
+
+    // Ответ Алисы получают оба устройства — через уже готовые сессии.
+    alice.ok(&["send", "@bobby", "вижу", "--wait", "0"]);
+    for u in [&bob, &phone] {
+        u.ok(&["sync"]);
+        assert!(u.ok(&["chat", "@alice"]).contains("@alice: вижу"));
+    }
+
+    // Телефон потерян: Боб отключает его.
+    let out = bob.ok(&["unlink", "2"]);
+    assert!(out.contains("отключено"), "{out}");
+    assert!(!bob.ok(&["devices"]).contains("телефон"));
+    let out = phone.run(&["sync"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("not in the account's device list"),
+        "{}",
+        stderr(&out)
+    );
+    // Алиса узнаёт об этом сама и пишет только на ноутбук.
+    let sent = alice.ok(&["send", "@bobby", "только ноутбуку", "--wait", "0"]);
+    assert!(sent.contains("отправлено: @bobby\n"), "{sent}");
+
+    // Подключать и отключать может только основное устройство.
+    assert!(stderr(&phone.run(&["unlink", "1"])).contains("основное"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

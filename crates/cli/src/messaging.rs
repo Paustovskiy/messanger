@@ -5,18 +5,20 @@
 //! ([`Db::immediate`]). Поэтому `listen` и `send`, запущенные одновременно,
 //! не портят друг другу состояние храповика, а сбой посередине ничего не ломает.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crypto_core::{
     Bundle, CryptoError, Identity, PeerKeys, PrekeySecrets, SessionSet, envelope_id,
     new_one_time_prekey, verify_signed_prekey,
 };
 use protocol::{
-    ClientMessage, Envelope, EnvelopeB64, OneTimePrekeyB64, ProtocolError, SignedPrekey,
-    SignedPrekeyB64,
+    ClientMessage, Content, Envelope, EnvelopeB64, OneTimePrekeyB64, PRIMARY_DEVICE, ProtocolError,
+    SignedPrekey, SignedPrekeyB64,
 };
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use storage::{
-    ContactRow, Db, Direction, NewMessage, OwnOneTimePrekey, OwnSignedPrekey, StoredPrekey,
+    ContactRow, Db, Direction, NewMessage, OutboxItem, OwnOneTimePrekey, OwnSignedPrekey,
+    StoredPrekey,
 };
 
 /// Как часто менять подписанный предключ.
@@ -29,20 +31,8 @@ const ONE_TIME_LOW_WATER: u32 = 20;
 /// Сколько одноразовых предключей добавлять за раз.
 const ONE_TIME_BATCH: u32 = 50;
 
-/// Ключи собеседника для сессии. Без ключа подписи (контакт из старой версии)
-/// безопасно переписываться нельзя.
-pub fn peer_keys(c: &ContactRow) -> Result<PeerKeys> {
-    let ed25519_pub = c.sign_public.context(
-        "контакт добавлен старой версией без ключа подписи; добавьте его карточку заново",
-    )?;
-    Ok(PeerKeys {
-        account_id: c.account_id.clone(),
-        x25519_pub: c.public,
-        ed25519_pub,
-    })
-}
-
-/// Предключ из карточки собеседника — запасной вариант без релея.
+/// Предключ из карточки собеседника — запасной вариант без релея
+/// (только для его основного устройства: карточку выдаёт оно).
 pub fn card_bundle(c: &ContactRow) -> Option<Bundle> {
     c.signed_prekey.map(|k| Bundle {
         signed_prekey: SignedPrekey {
@@ -66,72 +56,155 @@ pub fn verified_card_prekey(owner_ed25519: &[u8; 32], k: &SignedPrekeyB64) -> Re
     })
 }
 
-/// Можем ли мы прямо сейчас писать этому контакту без новых предключей.
-pub fn can_send_now(db: &Db, peer: &str) -> Result<bool> {
-    Ok(match db.load_sessions(peer)? {
-        Some(json) => SessionSet::from_json(&json)?.can_send(),
-        None => false,
-    })
+/// Можем ли мы прямо сейчас писать этому устройству без новых предключей.
+pub fn can_send_now(db: &Db, peer: &PeerKeys) -> Result<bool> {
+    Ok(load_set(db, peer)?.can_send())
 }
 
-/// Зашифровать сообщение и положить его в исходящие.
-/// Если сессии ещё нет, она начинается по `bundle` (с релея) или по предключу
-/// из карточки. Возвращает `(конверт, msg_id)`.
-pub fn seal_and_store(
+/// Адрес устройства — ключ для словарей.
+pub type DeviceKey = (String, u32);
+
+pub fn device_key(k: &PeerKeys) -> DeviceKey {
+    (k.account_id.clone(), k.device_id)
+}
+
+/// Результат шифрования одного сообщения для всех устройств.
+pub struct Sealed {
+    /// ID сообщения (общий для всех его конвертов).
+    pub message_id: String,
+    /// Конверты — уже лежат в исходящих.
+    pub items: Vec<OutboxItem>,
+    /// Устройства, которым зашифровать не удалось, и почему.
+    pub skipped: Vec<(PeerKeys, String)>,
+}
+
+/// Зашифровать сообщение для каждого устройства собеседника (`recipients`)
+/// и копию для остальных своих устройств (`own`), сохранить сообщение и
+/// положить конверты в исходящие — одной транзакцией.
+///
+/// Если с устройством ещё нет сессии, она начинается по предключам из
+/// `bundles` (свежие, с релея) или — для основного устройства собеседника —
+/// по предключу из его карточки.
+pub fn seal_message(
     db: &Db,
     me: &Identity,
     contact: &ContactRow,
-    bundle: Option<Bundle>,
+    recipients: &[PeerKeys],
+    own: &[PeerKeys],
+    bundles: &HashMap<DeviceKey, Option<Bundle>>,
     text: &str,
-) -> Result<(EnvelopeB64, String)> {
-    let peer = peer_keys(contact)?;
+) -> Result<Sealed> {
+    let message_id = hex(&crypto_core::random_bytes::<16>());
+    let to_peer = Content::Text {
+        id: message_id.clone(),
+        body: text.into(),
+    }
+    .to_bytes();
+    let copy = Content::Sent {
+        id: message_id.clone(),
+        to: contact.account_id.clone(),
+        body: text.into(),
+    }
+    .to_bytes();
+
     db.immediate(|| {
-        let mut set = load_set(db, &peer.account_id)?;
-        if !set.can_send() {
-            let bundle = bundle.or_else(|| card_bundle(contact)).context(
-                "у собеседника ещё нет предключей: пусть он хоть раз подключится к релею \
-                 (`messenger listen`) или пришлёт свежую карточку",
-            )?;
-            me.start_session(&peer, &bundle, &mut set)
-                .context("не удалось начать сессию")?;
+        let mut items = vec![];
+        let mut skipped = vec![];
+        let targets = recipients
+            .iter()
+            .map(|k| (k, &to_peer))
+            .chain(own.iter().map(|k| (k, &copy)));
+        for (peer, content) in targets {
+            let mut set = load_set(db, peer)?;
+            if !set.can_send() {
+                let bundle = bundles
+                    .get(&device_key(peer))
+                    .cloned()
+                    .flatten()
+                    .or_else(|| {
+                        (peer.account_id == contact.account_id && peer.device_id == PRIMARY_DEVICE)
+                            .then(|| card_bundle(contact))
+                            .flatten()
+                    });
+                let Some(bundle) = bundle else {
+                    skipped.push((
+                        peer.clone(),
+                        "нет предключей: устройство ещё ни разу не подключалось к релею".into(),
+                    ));
+                    continue;
+                };
+                if let Err(e) = me.start_session(peer, &bundle, &mut set) {
+                    skipped.push((peer.clone(), format!("не удалось начать сессию: {e}")));
+                    continue;
+                }
+            }
+            let env = me.seal(peer, &mut set, content)?;
+            db.save_sessions(&peer.account_id, peer.device_id, &set.to_json())?;
+            items.push(OutboxItem {
+                message_id: message_id.clone(),
+                peer_account_id: contact.account_id.clone(),
+                to_account_id: peer.account_id.clone(),
+                to_device_id: peer.device_id,
+                envelope_id: envelope_id(&env),
+                envelope_json: serde_json::to_string(&EnvelopeB64::from(&env))?,
+            });
         }
-        let env = me.seal(&peer, &mut set, text.as_bytes())?;
-        let msg_id = envelope_id(&env);
-        let wire = EnvelopeB64::from(&env);
-        db.save_sessions(&peer.account_id, &set.to_json())?;
+        if !items.iter().any(|i| i.to_account_id == contact.account_id) {
+            bail!(
+                "у собеседника ещё нет предключей: пусть он хоть раз подключится к релею \
+                 (`messenger listen`) или пришлёт свежую карточку"
+            );
+        }
         db.insert_message(&NewMessage {
             direction: Direction::Out,
-            peer_account_id: &peer.account_id,
+            peer_account_id: &contact.account_id,
             peer_username: contact.username.as_deref(),
             plaintext: text,
-            envelope_json: &serde_json::to_string(&wire)?,
-            msg_id: &msg_id,
+            envelope_json: "",
+            msg_id: &message_id,
         })?;
-        Ok((wire, msg_id))
+        for item in &items {
+            db.insert_outbox(item)?;
+        }
+        Ok(Sealed {
+            message_id: message_id.clone(),
+            items,
+            skipped,
+        })
     })
 }
 
 pub enum Incoming {
-    New(String),
+    /// Новое сообщение. `Out` — копия того, что мы сами отправили `peer`
+    /// с другого своего устройства.
+    New {
+        peer: String,
+        direction: Direction,
+        text: String,
+    },
     Duplicate,
 }
 
-/// Проверить, расшифровать и сохранить входящее сообщение.
+fn bad_content(why: &str) -> anyhow::Error {
+    ProtocolError::InvalidContent(why.into()).into()
+}
+
+/// Проверить, расшифровать и сохранить входящий конверт от устройства `sender`.
 pub fn open_and_store(
     db: &Db,
     me: &Identity,
-    contact: &ContactRow,
+    sender: &PeerKeys,
     wire: &EnvelopeB64,
-    msg_id: &str,
+    envelope_id: &str,
 ) -> Result<Incoming> {
-    let peer = peer_keys(contact)?;
     let env = Envelope::try_from(wire)?;
+    let (from, device) = (sender.account_id.as_str(), sender.device_id);
     db.immediate(|| {
         // Дубль отбрасываем до расшифровки: ключ этого сообщения уже стёрт.
-        if db.has_incoming(&peer.account_id, msg_id)? {
+        if db.is_envelope_seen(from, device, envelope_id)? {
             return Ok(Incoming::Duplicate);
         }
-        let mut set = load_set(db, &peer.account_id)?;
+        let mut set = load_set(db, sender)?;
         let secrets = match env.prekey {
             None => PrekeySecrets::default(),
             Some(p) => PrekeySecrets {
@@ -140,28 +213,49 @@ pub fn open_and_store(
                     Some(id) => db.one_time_prekey_secret(id)?,
                     None => None,
                 },
-                ek_already_used: db.is_ek_used(&peer.account_id, &p.ek_pub)?,
+                ek_already_used: db.is_ek_used(from, device, &p.ek_pub)?,
             },
         };
-        let opened = me.open(&peer, &mut set, &env, &secrets)?;
+        let opened = me.open(sender, &mut set, &env, &secrets)?;
+        let own_device = from == me.account_id();
+        let (direction, peer, id, text) = match Content::from_bytes(&opened.plaintext)? {
+            Content::Text { .. } if own_device => {
+                return Err(bad_content("own device sent a text instead of a copy"));
+            }
+            Content::Text { id, body } => (Direction::In, from.to_owned(), id, body),
+            // Копию «я отправил» принимаем только от своих устройств: иначе
+            // кто угодно мог бы приписать нам сообщения.
+            Content::Sent { id, to, body } if own_device => (Direction::Out, to, id, body),
+            Content::Sent { .. } => return Err(bad_content("a copy from a foreign account")),
+        };
+
         if let Some(ek) = opened.new_session_ek {
-            db.mark_ek_used(&peer.account_id, &ek)?;
+            db.mark_ek_used(from, device, &ek)?;
         }
         if let Some(id) = opened.consumed_one_time {
             // Одноразовый ключ стирается сразу — в этом его смысл.
             db.delete_one_time_prekey(id)?;
         }
-        db.save_sessions(&peer.account_id, &set.to_json())?;
-        let text = String::from_utf8_lossy(&opened.plaintext).into_owned();
-        db.insert_message(&NewMessage {
-            direction: Direction::In,
-            peer_account_id: &peer.account_id,
-            peer_username: contact.username.as_deref(),
+        db.save_sessions(from, device, &set.to_json())?;
+        db.mark_envelope_seen(from, device, envelope_id)?;
+
+        let username = db.get_contact(&peer)?.and_then(|c| c.username);
+        let inserted = db.insert_message(&NewMessage {
+            direction,
+            peer_account_id: &peer,
+            peer_username: username.as_deref(),
             plaintext: &text,
             envelope_json: &serde_json::to_string(wire)?,
-            msg_id,
+            msg_id: &id,
         })?;
-        Ok(Incoming::New(text))
+        Ok(match inserted {
+            Some(_) => Incoming::New {
+                peer,
+                direction,
+                text,
+            },
+            None => Incoming::Duplicate,
+        })
     })
 }
 
@@ -253,11 +347,15 @@ pub fn prekeys_to_publish(
     }))
 }
 
-fn load_set(db: &Db, peer: &str) -> Result<SessionSet> {
-    Ok(match db.load_sessions(peer)? {
+fn load_set(db: &Db, peer: &PeerKeys) -> Result<SessionSet> {
+    Ok(match db.load_sessions(&peer.account_id, peer.device_id)? {
         Some(json) => SessionSet::from_json(&json)?,
         None => SessionSet::default(),
     })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn unix_now() -> i64 {

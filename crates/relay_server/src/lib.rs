@@ -3,15 +3,17 @@
 //! Релей — «почтовый ящик»: он видит, кто кому пишет, но не видит, что
 //! (содержимое зашифровано на клиентах). Его задачи:
 //!
-//! 1. **Пустить только владельца аккаунта.** При подключении релей присылает
-//!    случайный nonce, клиент подписывает его ключом Ed25519. Первый успешный
-//!    вход закрепляет ключ за `account_id` (trust-on-first-use), дальше войти
-//!    под этим `account_id` с другим ключом нельзя.
+//! 1. **Пустить только владельца устройства.** При подключении релей присылает
+//!    случайный nonce, устройство подписывает его своим ключом Ed25519.
+//!    Основное устройство (№1) входит ключом аккаунта: первый успешный вход
+//!    закрепляет ключ за `account_id` (trust-on-first-use; новые ID к тому же
+//!    выведены из ключа). Остальные устройства релей пускает, только если они
+//!    есть в последнем списке устройств, подписанном ключом аккаунта.
 //! 2. **Не пропустить мусор и подделки.** Конверт должен быть подписан
-//!    отправителем, а его `from`/`to` — совпадать с реальными.
-//! 3. **Не потерять сообщение.** Конверт лежит в SQLite, пока получатель
-//!    не подтвердит (`ack`), что сохранил его у себя. Доставка «хотя бы один
-//!    раз»; дубли клиент отбрасывает по `msg_id`.
+//!    устройством-отправителем, а его `from`/`to` — совпадать с реальными.
+//! 3. **Не потерять сообщение.** Конверт лежит в SQLite, пока устройство-получатель
+//!    не подтвердит (`ack`), что сохранило его у себя. Доставка «хотя бы один
+//!    раз»; дубли клиент отбрасывает по `msg_id`. Очередь у каждого устройства своя.
 
 pub mod ratelimit;
 pub mod store;
@@ -30,8 +32,8 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
-    ClientMessage, Envelope, OneTimePrekey, OneTimePrekeyB64, ServerMessage, SignedPrekey,
-    SignedPrekeyB64, b64, check_id, decode_fixed,
+    ClientMessage, DeviceList, Envelope, OneTimePrekey, OneTimePrekeyB64, PRIMARY_DEVICE,
+    ServerMessage, SignedDeviceListB64, SignedPrekey, SignedPrekeyB64, b64, check_id, decode_fixed,
 };
 use ratelimit::{Rate, RateLimiter};
 use std::future::Future;
@@ -40,9 +42,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use store::{Binding, Enqueue, Kind, Store};
+use store::{Binding, Device, Enqueue, Kind, Store};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, warn};
 
 /// Настройки релея.
@@ -52,7 +54,7 @@ pub struct Config {
     pub db_path: Option<PathBuf>,
     /// Сколько хранить недоставленные сообщения.
     pub message_ttl: Duration,
-    /// Максимум сообщений в очереди одного получателя.
+    /// Максимум сообщений в очереди одного устройства-получателя.
     pub max_queue_per_recipient: usize,
     /// Сколько ждать входа после подключения.
     pub auth_timeout: Duration,
@@ -77,13 +79,13 @@ pub struct Config {
 pub struct Limits {
     /// Новых подключений с одного IP.
     pub connections_per_ip: Rate,
-    /// Одновременных соединений одного аккаунта.
+    /// Одновременных соединений одного устройства.
     pub max_connections_per_account: usize,
     /// Любых сообщений от одного соединения (защита от флуда).
     pub frames_per_connection: Rate,
     /// Отправленных конвертов от одного аккаунта.
     pub sends: Rate,
-    /// Публикаций предключей от одного аккаунта.
+    /// Публикаций предключей и списков устройств от одного аккаунта.
     pub publishes: Rate,
     /// Запросов предключей от одного аккаунта; сверх — без одноразового ключа.
     pub bundle_fetches: Rate,
@@ -157,15 +159,24 @@ impl Default for Config {
 struct Client {
     conn_id: u64,
     tx: mpsc::UnboundedSender<String>,
+    /// Сигнал «устройство отключили от аккаунта — закрыть соединение».
+    kick: Arc<Notify>,
+}
+
+/// Устройство в таблице «кто онлайн».
+type DeviceKey = (String, u32);
+
+fn key((account, device): Device<'_>) -> DeviceKey {
+    (account.to_owned(), device)
 }
 
 struct Inner {
     config: Config,
     store: Store,
-    /// Кто сейчас онлайн: account_id → канал в его сокет.
-    /// У одного аккаунта может быть несколько соединений одновременно
+    /// Кто сейчас онлайн: (account_id, device_id) → каналы в его сокеты.
+    /// У одного устройства может быть несколько соединений одновременно
     /// (например, `listen` и `send` в соседних терминалах) — шлём всем.
-    online: DashMap<String, Vec<Client>>,
+    online: DashMap<DeviceKey, Vec<Client>>,
     next_conn_id: AtomicU64,
     limiters: Limiters,
 }
@@ -213,9 +224,9 @@ impl Relay {
         Ok(result?)
     }
 
-    /// Отправить JSON во все соединения получателя. `true`, если хоть одно живо.
-    fn push(&self, account_id: &str, json: String) -> bool {
-        let Some(clients) = self.0.online.get(account_id) else {
+    /// Отправить JSON во все соединения устройства. `true`, если хоть одно живо.
+    fn push(&self, device: Device<'_>, json: String) -> bool {
+        let Some(clients) = self.0.online.get(&key(device)) else {
             return false;
         };
         // Именно во все: короткое замыкание (`any`) пропустило бы остальные соединения.
@@ -224,6 +235,35 @@ impl Relay {
             delivered |= c.tx.send(json.clone()).is_ok();
         }
         delivered
+    }
+
+    /// Закрыть все соединения устройства.
+    fn kick(&self, device: Device<'_>) {
+        if let Some(clients) = self.0.online.get(&key(device)) {
+            for c in clients.iter() {
+                c.kick.notify_one();
+            }
+        }
+    }
+
+    /// Последний принятый список устройств аккаунта.
+    fn device_list(&self, account_id: &str) -> Result<Option<(DeviceList, SignedDeviceListB64)>> {
+        let Some((_, json)) = self.0.store.device_list(account_id)? else {
+            return Ok(None);
+        };
+        let wire: SignedDeviceListB64 = serde_json::from_str(&json)?;
+        let (list, _) = wire.parts()?;
+        Ok(Some((list, wire)))
+    }
+
+    /// Есть ли у аккаунта такое устройство. Основное есть всегда.
+    fn device_exists(&self, (account_id, device_id): Device<'_>) -> Result<bool> {
+        if device_id == PRIMARY_DEVICE {
+            return Ok(true);
+        }
+        Ok(self
+            .device_list(account_id)?
+            .is_some_and(|(l, _)| l.device(device_id).is_some()))
     }
 }
 
@@ -351,14 +391,21 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
             match serde_json::from_str::<ClientMessage>(&text) {
                 Ok(ClientMessage::Auth {
                     account_id,
+                    device_id,
                     sign_pub_b64,
                     sig_b64,
                 }) => {
-                    return match authenticate(&relay, &nonce, &account_id, &sign_pub_b64, &sig_b64)
-                    {
-                        Ok(sign_pub) => Some((account_id, sign_pub)),
+                    return match authenticate(
+                        &relay,
+                        &nonce,
+                        &account_id,
+                        device_id,
+                        &sign_pub_b64,
+                        &sig_b64,
+                    ) {
+                        Ok(sign_pub) => Some((account_id, device_id, sign_pub)),
                         Err(reason) => {
-                            warn!(account_id, "auth rejected: {reason}");
+                            warn!(account_id, device_id, "auth rejected: {reason}");
                             let _ = tx.send(error(reason, None));
                             None
                         }
@@ -376,7 +423,7 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
     })
     .await;
 
-    let Ok(Some((me, my_sign_pub))) = auth else {
+    let Ok(Some((me, my_device, my_sign_pub))) = auth else {
         if auth.is_err() {
             let _ = tx.send(error("authentication timeout", None));
         }
@@ -385,11 +432,13 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
         return;
     };
 
+    let my = (me.as_str(), my_device);
+    let kick = Arc::new(Notify::new());
     {
-        let mut clients = relay.0.online.entry(me.clone()).or_default();
+        let mut clients = relay.0.online.entry(key(my)).or_default();
         if clients.len() >= relay.0.config.limits.max_connections_per_account {
             drop(clients);
-            warn!(account_id = %me, "too many simultaneous connections");
+            warn!(account_id = %me, device_id = my_device, "too many simultaneous connections");
             let _ = tx.send(error(
                 "too many simultaneous connections for this account",
                 None,
@@ -401,21 +450,32 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
         clients.push(Client {
             conn_id,
             tx: tx.clone(),
+            kick: kick.clone(),
         });
     }
     let _ = tx.send(to_json(&ServerMessage::Authenticated {
         account_id: me.clone(),
+        device_id: my_device,
     }));
-    info!(account_id = %me, conn_id, "client authenticated");
+    info!(account_id = %me, device_id = my_device, conn_id, "client authenticated");
 
-    flush_queue(&relay, &me, &tx);
+    flush_queue(&relay, my, &tx);
     // Статус предключей идёт после очереди и заодно говорит клиенту:
     // «всё, что накопилось, ты уже получил».
-    let _ = tx.send(prekey_status(&relay, &me));
+    let _ = tx.send(prekey_status(&relay, my));
 
     // --- 2. основной цикл ------------------------------------------------
     let frames = RateLimiter::new(relay.0.config.limits.frames_per_connection);
-    while let Some(msg) = next_msg().await {
+    loop {
+        let msg = tokio::select! {
+            msg = next_msg() => msg,
+            _ = kick.notified() => {
+                info!(account_id = %me, device_id = my_device, "device removed from account, disconnecting");
+                let _ = tx.send(error("this device was removed from the account", None));
+                break;
+            }
+        };
+        let Some(msg) = msg else { break };
         if matches!(msg, Message::Text(_) | Message::Binary(_)) && !frames.check("") {
             let _ = tx.send(error(RATE_LIMITED, None));
             continue;
@@ -424,30 +484,56 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
                 Ok(ClientMessage::Send {
                     to,
+                    to_device,
                     msg_id,
                     envelope,
                 }) => {
                     let reply = if relay.0.limiters.sends.check(&me) {
-                        handle_send(&relay, &me, &my_sign_pub, &to, &msg_id, envelope)
+                        handle_send(
+                            &relay,
+                            my,
+                            &my_sign_pub,
+                            (&to, to_device),
+                            &msg_id,
+                            envelope,
+                        )
                     } else {
                         error(RATE_LIMITED, Some(msg_id))
                     };
                     let _ = tx.send(reply);
                 }
-                Ok(ClientMessage::Ack { to, msg_id }) => handle_ack(&relay, &me, &to, &msg_id),
+                Ok(ClientMessage::Ack {
+                    to,
+                    to_device,
+                    msg_id,
+                }) => handle_ack(&relay, my, (&to, to_device), &msg_id),
                 Ok(ClientMessage::PublishPrekeys {
                     signed_prekey,
                     one_time,
                 }) => {
                     let reply = if relay.0.limiters.publishes.check(&me) {
-                        handle_publish(&relay, &me, &my_sign_pub, &signed_prekey, &one_time)
+                        handle_publish(&relay, my, &my_sign_pub, &signed_prekey, &one_time)
                     } else {
                         error(RATE_LIMITED, None)
                     };
                     let _ = tx.send(reply);
                 }
-                Ok(ClientMessage::FetchBundle { account_id }) => {
-                    let _ = tx.send(handle_fetch_bundle(&relay, &me, &account_id));
+                Ok(ClientMessage::FetchBundle {
+                    account_id,
+                    device_id,
+                }) => {
+                    let _ = tx.send(handle_fetch_bundle(&relay, &me, (&account_id, device_id)));
+                }
+                Ok(ClientMessage::PublishDeviceList { list }) => {
+                    let reply = if relay.0.limiters.publishes.check(&me) {
+                        handle_publish_device_list(&relay, my, &my_sign_pub, list)
+                    } else {
+                        error(RATE_LIMITED, None)
+                    };
+                    let _ = tx.send(reply);
+                }
+                Ok(ClientMessage::FetchDeviceList { account_id }) => {
+                    let _ = tx.send(handle_fetch_device_list(&relay, &account_id));
                 }
                 Ok(ClientMessage::Auth { .. }) => {
                     let _ = tx.send(error("already authenticated", None));
@@ -463,22 +549,24 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
 
     // Убираем из онлайна только это соединение: остальные соединения
     // того же аккаунта (другой терминал, переподключение) продолжают работать.
-    if let Some(mut clients) = relay.0.online.get_mut(&me) {
+    if let Some(mut clients) = relay.0.online.get_mut(&key(my)) {
         clients.retain(|c| c.conn_id != conn_id);
     }
     relay
         .0
         .online
-        .remove_if(&me, |_, clients| clients.is_empty());
-    info!(account_id = %me, conn_id, "client disconnected");
+        .remove_if(&key(my), |_, clients| clients.is_empty());
+    info!(account_id = %me, device_id = my_device, conn_id, "client disconnected");
     drop(tx);
-    writer.abort();
+    // Дать писателю дослать последнее (например, причину отключения).
+    let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
 }
 
 fn authenticate(
     relay: &Relay,
     nonce: &[u8; 32],
     account_id: &str,
+    device_id: u32,
     sign_pub_b64: &str,
     sig_b64: &str,
 ) -> Result<[u8; 32], String> {
@@ -486,9 +574,26 @@ fn authenticate(
     let sign_pub = decode_fixed::<32>(sign_pub_b64, "sign_pub_b64").map_err(|e| e.to_string())?;
     let sig = decode_fixed::<64>(sig_b64, "sig_b64").map_err(|e| e.to_string())?;
 
-    let data = protocol::relay_auth_signing_bytes(nonce, account_id);
+    let data = protocol::relay_auth_signing_bytes(nonce, account_id, device_id);
     if !crypto_core::verify_signature(&sign_pub, &data, &sig) {
         return Err("invalid auth signature".into());
+    }
+    if device_id != PRIMARY_DEVICE {
+        // Дополнительное устройство: его ключ должен быть в подписанном списке.
+        return match relay.device_list(account_id) {
+            Ok(Some((list, _)))
+                if list
+                    .device(device_id)
+                    .is_some_and(|d| d.ed25519_pub == sign_pub) =>
+            {
+                Ok(sign_pub)
+            }
+            Ok(_) => Err("this device is not in the account's device list".into()),
+            Err(e) => {
+                warn!("store error during auth: {e:#}");
+                Err("internal error".into())
+            }
+        };
     }
     // Новые ID выведены из ключа — их можно проверить ещё до первого входа,
     // поэтому «застолбить» чужой ID своим ключом нельзя.
@@ -510,16 +615,25 @@ fn authenticate(
 }
 
 /// Отдать накопившуюся очередь новому соединению (остальные её уже получали).
-fn flush_queue(relay: &Relay, me: &str, tx: &mpsc::UnboundedSender<String>) {
+fn flush_queue(relay: &Relay, me: Device<'_>, tx: &mpsc::UnboundedSender<String>) {
     let items = match relay.0.store.pending_for(me) {
         Ok(items) => items,
         Err(e) => {
-            warn!(account_id = me, "cannot read queue: {e:#}");
+            warn!(
+                account_id = me.0,
+                device_id = me.1,
+                "cannot read queue: {e:#}"
+            );
             return;
         }
     };
     if !items.is_empty() {
-        debug!(account_id = me, count = items.len(), "flushing queue");
+        debug!(
+            account_id = me.0,
+            device_id = me.1,
+            count = items.len(),
+            "flushing queue"
+        );
     }
     for item in items {
         if tx.send(item.payload).is_err() {
@@ -536,30 +650,39 @@ fn flush_queue(relay: &Relay, me: &str, tx: &mpsc::UnboundedSender<String>) {
 
 fn handle_send(
     relay: &Relay,
-    me: &str,
+    me: Device<'_>,
     my_sign_pub: &[u8; 32],
-    to: &str,
+    to: Device<'_>,
     msg_id: &str,
     envelope: protocol::EnvelopeB64,
 ) -> String {
     let reject = |reason: String| error(reason, Some(msg_id.to_owned()));
 
-    if let Err(e) = check_id(to, "to").and_then(|_| check_id(msg_id, "msg_id")) {
+    if let Err(e) = check_id(to.0, "to").and_then(|_| check_id(msg_id, "msg_id")) {
         return reject(e.to_string());
     }
     let env = match Envelope::try_from(&envelope) {
         Ok(env) => env,
         Err(e) => return reject(format!("bad envelope: {e}")),
     };
-    if env.from != me || env.to != to {
+    if (env.from.as_str(), env.from_device) != me || (env.to.as_str(), env.to_device) != to {
         return reject("envelope from/to does not match the sender/recipient".into());
     }
     if crypto_core::verify_envelope(&env, my_sign_pub).is_err() {
         return reject("envelope is not signed by the sender".into());
     }
+    match relay.device_exists(to) {
+        Ok(true) => {}
+        Ok(false) => return reject("recipient has no such device".into()),
+        Err(e) => {
+            warn!("device lookup failed: {e:#}");
+            return reject("internal error".into());
+        }
+    }
 
     let deliver = to_json(&ServerMessage::Deliver {
-        from: me.to_owned(),
+        from: me.0.to_owned(),
+        from_device: me.1,
         msg_id: msg_id.to_owned(),
         envelope,
     });
@@ -584,7 +707,7 @@ fn handle_send(
     }
 }
 
-fn handle_ack(relay: &Relay, me: &str, to: &str, msg_id: &str) {
+fn handle_ack(relay: &Relay, me: Device<'_>, to: Device<'_>, msg_id: &str) {
     // Пересылаем подтверждение, только если такое сообщение действительно
     // ждало `me` от `to`. Так нельзя заспамить кого-то фальшивыми ack.
     match relay.0.store.remove_delivered(me, to, msg_id) {
@@ -596,7 +719,8 @@ fn handle_ack(relay: &Relay, me: &str, to: &str, msg_id: &str) {
         }
     }
     let ack = to_json(&ServerMessage::DeliverAck {
-        from: me.to_owned(),
+        from: me.0.to_owned(),
+        from_device: me.1,
         msg_id: msg_id.to_owned(),
     });
     if !relay.push(to, ack.clone()) {
@@ -611,12 +735,19 @@ fn handle_ack(relay: &Relay, me: &str, to: &str, msg_id: &str) {
     }
 }
 
-fn prekey_status(relay: &Relay, me: &str) -> String {
-    match relay.0.store.prekey_status(me) {
-        Ok((has_signed_prekey, one_time_left)) => to_json(&ServerMessage::PrekeyStatus {
-            has_signed_prekey,
-            one_time_left,
-        }),
+fn prekey_status(relay: &Relay, me: Device<'_>) -> String {
+    let status = relay.0.store.prekey_status(me).and_then(|(signed, left)| {
+        let version = relay.0.store.device_list(me.0)?.map(|(v, _)| v);
+        Ok((signed, left, version))
+    });
+    match status {
+        Ok((has_signed_prekey, one_time_left, device_list_version)) => {
+            to_json(&ServerMessage::PrekeyStatus {
+                has_signed_prekey,
+                one_time_left,
+                device_list_version,
+            })
+        }
         Err(e) => {
             warn!("prekey status failed: {e:#}");
             error("internal error", None)
@@ -626,7 +757,7 @@ fn prekey_status(relay: &Relay, me: &str) -> String {
 
 fn handle_publish(
     relay: &Relay,
-    me: &str,
+    me: Device<'_>,
     my_sign_pub: &[u8; 32],
     signed: &SignedPrekeyB64,
     one_time: &[OneTimePrekeyB64],
@@ -656,6 +787,13 @@ fn handle_publish(
         Ok(left) => to_json(&ServerMessage::PrekeyStatus {
             has_signed_prekey: true,
             one_time_left: left,
+            device_list_version: relay
+                .0
+                .store
+                .device_list(me.0)
+                .ok()
+                .flatten()
+                .map(|(v, _)| v),
         }),
         Err(e) => {
             warn!("publish prekeys failed: {e:#}");
@@ -664,7 +802,8 @@ fn handle_publish(
     }
 }
 
-fn handle_fetch_bundle(relay: &Relay, me: &str, account_id: &str) -> String {
+fn handle_fetch_bundle(relay: &Relay, me: &str, target: Device<'_>) -> String {
+    let (account_id, device_id) = target;
     if let Err(e) = check_id(account_id, "account_id") {
         return error(e.to_string(), None);
     }
@@ -672,17 +811,18 @@ fn handle_fetch_bundle(relay: &Relay, me: &str, account_id: &str) -> String {
     // а «выкачать» чужие одноразовые ключи не получится.
     let requester_ok = relay.0.limiters.bundle_fetches.check(me);
     let allow_one_time = || {
-        let ok = requester_ok && relay.0.limiters.one_time_per_target.check(account_id);
+        let target_key = format!("{account_id}/{device_id}");
+        let ok = requester_ok && relay.0.limiters.one_time_per_target.check(&target_key);
         if !ok {
             debug!(
                 requester = me,
-                target = account_id,
+                target = target_key,
                 "one-time prekey withheld by rate limit"
             );
         }
         ok
     };
-    match relay.0.store.take_bundle(account_id, allow_one_time) {
+    match relay.0.store.take_bundle(target, allow_one_time) {
         Ok(bundle) => {
             let (signed_prekey, one_time) = match bundle {
                 Some((s, o)) => (
@@ -693,12 +833,88 @@ fn handle_fetch_bundle(relay: &Relay, me: &str, account_id: &str) -> String {
             };
             to_json(&ServerMessage::Bundle {
                 account_id: account_id.to_owned(),
+                device_id,
                 signed_prekey,
                 one_time,
             })
         }
         Err(e) => {
             warn!("fetch bundle failed: {e:#}");
+            error("internal error", None)
+        }
+    }
+}
+
+fn handle_publish_device_list(
+    relay: &Relay,
+    me: Device<'_>,
+    my_sign_pub: &[u8; 32],
+    wire: SignedDeviceListB64,
+) -> String {
+    if me.1 != PRIMARY_DEVICE {
+        return error("only the primary device can change the device list", None);
+    }
+    // Ключ основного устройства и есть ключ аккаунта.
+    let list = match crypto_core::verify_device_list(&wire, me.0, Some(my_sign_pub)) {
+        Ok(l) => l,
+        Err(e) => return error(format!("bad device list: {e}"), None),
+    };
+    let old = match relay.device_list(me.0) {
+        Ok(old) => old,
+        Err(e) => {
+            warn!("device list lookup failed: {e:#}");
+            return error("internal error", None);
+        }
+    };
+    if let Some((old, old_wire)) = &old {
+        if list.version < old.version || (list.version == old.version && *old_wire != wire) {
+            return error("stale device list version", None);
+        }
+    }
+    let json = serde_json::to_string(&wire).expect("serializable");
+    if let Err(e) = relay.0.store.save_device_list(me.0, list.version, &json) {
+        warn!("save device list failed: {e:#}");
+        return error("internal error", None);
+    }
+
+    // Убранные устройства (или чей номер теперь с другими ключами): забыть их
+    // очередь и предключи и закрыть соединения.
+    if let Some((old, _)) = old {
+        for d in &old.devices {
+            if list.device(d.device_id) != Some(d) {
+                info!(account_id = me.0, device_id = d.device_id, "device removed");
+                if let Err(e) = relay.0.store.forget_device((me.0, d.device_id)) {
+                    warn!("forget device failed: {e:#}");
+                }
+                relay.kick((me.0, d.device_id));
+            }
+        }
+    }
+
+    let reply = to_json(&ServerMessage::DeviceList {
+        account_id: me.0.to_owned(),
+        list: Some(wire),
+    });
+    // Остальные устройства аккаунта узнают о новом списке сразу.
+    for d in &list.devices {
+        if d.device_id != me.1 {
+            relay.push((me.0, d.device_id), reply.clone());
+        }
+    }
+    reply
+}
+
+fn handle_fetch_device_list(relay: &Relay, account_id: &str) -> String {
+    if let Err(e) = check_id(account_id, "account_id") {
+        return error(e.to_string(), None);
+    }
+    match relay.device_list(account_id) {
+        Ok(list) => to_json(&ServerMessage::DeviceList {
+            account_id: account_id.to_owned(),
+            list: list.map(|(_, wire)| wire),
+        }),
+        Err(e) => {
+            warn!("fetch device list failed: {e:#}");
             error("internal error", None)
         }
     }

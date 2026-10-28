@@ -1,11 +1,17 @@
 //! Локальная база клиента (SQLite).
 //!
 //! Что хранится:
-//! * `identities` — своя личность (одна на базу) вместе с **секретными ключами**;
-//! * `contacts`   — проверенные карточки собеседников;
-//! * `messages`   — история переписки и исходящая очередь;
-//! * `sessions`, `signed_prekeys`, `one_time_prekeys`, `used_prekey_eks` —
-//!   состояние Double Ratchet и предключи X3DH (тоже **секретные**).
+//! * `identities`   — своя личность (одна на базу: это ключи **этого устройства**)
+//!   вместе с **секретными ключами**;
+//! * `contacts`     — проверенные карточки собеседников;
+//! * `device_lists` — подписанные списки устройств: свой и собеседников;
+//! * `messages`     — история переписки (одно сообщение — одна строка, сколько бы
+//!   устройств его ни получало);
+//! * `outbox`       — исходящие конверты: по одному на каждое устройство получателя;
+//! * `sessions`, `signed_prekeys`, `one_time_prekeys`, `used_prekey_eks`,
+//!   `seen_envelopes` — состояние Double Ratchet и предключи X3DH (тоже
+//!   **секретные**). Сессии свои у каждого устройства собеседника;
+//! * `pending_link` — ключи устройства, которое ждёт подключения к аккаунту.
 //!
 //! Операции, которые читают и меняют состояние сессии, выполняются внутри
 //! [`Db::immediate`] — так два процесса (`listen` и `send`) не затрут друг другу
@@ -25,7 +31,7 @@ pub mod encryption;
 pub use encryption::{FileState, PasswordRequired, WrongPassword, file_state, reencrypt};
 
 /// Текущая версия схемы.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub struct Db {
     conn: Connection,
@@ -36,6 +42,8 @@ pub struct Db {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityRow {
     pub account_id: String,
+    /// Номер этого устройства в аккаунте (1 — основное).
+    pub device_id: u32,
     pub username: Option<String>,
     /// X25519 secret.
     pub secret: [u8; 32],
@@ -156,12 +164,36 @@ pub struct ThreadRow {
     pub unread_count: i64,
 }
 
-/// Исходящее сообщение, которое ещё не подтверждено получателем.
+/// Исходящий конверт для одного устройства, ещё не подтверждённый им.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingOutgoing {
+pub struct OutboxItem {
+    /// Какому сообщению из `messages` принадлежит конверт.
+    pub message_id: String,
+    /// Собеседник этого сообщения (для копий на свои устройства — тоже он).
     pub peer_account_id: String,
-    pub msg_id: String,
+    /// Куда идёт конверт: аккаунт и устройство.
+    pub to_account_id: String,
+    pub to_device_id: u32,
+    /// ID конверта (то, что подтверждает релей и получатель).
+    pub envelope_id: String,
     pub envelope_json: String,
+}
+
+/// Чем закончилось подтверждение конверта.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Acked {
+    pub message_id: String,
+    pub peer_account_id: String,
+    /// Сообщение только что стало «доставлено» (первое подтверждение от собеседника).
+    pub newly_delivered: bool,
+}
+
+/// Ключи устройства, которое ещё только подключается к аккаунту.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingLink {
+    pub x_secret: [u8; 32],
+    pub sign_secret: [u8; 32],
+    pub name: String,
 }
 
 /// Новое сообщение для [`Db::insert_message`].
@@ -176,7 +208,6 @@ pub struct NewMessage<'a> {
 }
 
 impl Db {
-    /// Открыть (или создать) базу по пути и мигрировать до актуальной схемы.
     /// Открыть (или создать) базу по пути и мигрировать до актуальной схемы.
     ///
     /// `password`: для зашифрованной базы — обязателен; для новой — если задан,
@@ -260,7 +291,7 @@ impl Db {
     pub fn get_local_identity(&self) -> Result<Option<IdentityRow>> {
         self.conn
             .query_row(
-                "SELECT account_id, username, secret, public, sign_secret, sign_public
+                "SELECT account_id, username, secret, public, sign_secret, sign_public, device_id
                  FROM identities ORDER BY created_at ASC, rowid ASC LIMIT 1",
                 [],
                 |r| {
@@ -271,6 +302,7 @@ impl Db {
                         public: blob32(r, 3)?,
                         sign_secret: blob32_opt(r, 4)?,
                         sign_public: blob32_opt(r, 5)?,
+                        device_id: r.get(6)?,
                     })
                 },
             )
@@ -281,14 +313,15 @@ impl Db {
     /// Создать или обновить личность по `account_id`.
     pub fn upsert_identity(&self, row: &IdentityRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO identities (account_id, username, secret, public, sign_secret, sign_public, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO identities (account_id, username, secret, public, sign_secret, sign_public, created_at, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(account_id) DO UPDATE SET
                  username    = excluded.username,
                  secret      = excluded.secret,
                  public      = excluded.public,
                  sign_secret = excluded.sign_secret,
-                 sign_public = excluded.sign_public",
+                 sign_public = excluded.sign_public,
+                 device_id   = excluded.device_id",
             params![
                 row.account_id,
                 row.username,
@@ -296,7 +329,8 @@ impl Db {
                 &row.public[..],
                 row.sign_secret.as_ref().map(|k| &k[..]),
                 row.sign_public.as_ref().map(|k| &k[..]),
-                unix_now()
+                unix_now(),
+                row.device_id,
             ],
         )?;
         Ok(())
@@ -364,12 +398,94 @@ impl Db {
         Ok(())
     }
 
-    /// Удалить контакт. Возвращает `false`, если такого не было.
+    /// Удалить контакт вместе с его списком устройств. Возвращает `false`,
+    /// если такого не было.
     pub fn delete_contact(&self, account_id: &str) -> Result<bool> {
+        self.conn.execute(
+            "DELETE FROM device_lists WHERE account_id = ?1",
+            params![account_id],
+        )?;
         Ok(self.conn.execute(
             "DELETE FROM contacts WHERE account_id = ?1",
             params![account_id],
         )? > 0)
+    }
+
+    // ----- списки устройств ----------------------------------------------
+
+    /// Сохранённый подписанный список устройств аккаунта: `(версия, JSON)`.
+    pub fn device_list(&self, account_id: &str) -> Result<Option<(u64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT version, list_json FROM device_lists WHERE account_id = ?1",
+                params![account_id],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Сохранить список устройств, если он новее сохранённого. Подпись проверяет
+    /// вызывающий. Возвращает `true`, если список заменён: откатить список на
+    /// старую версию (и вернуть удалённое устройство) нельзя.
+    pub fn save_device_list(
+        &self,
+        account_id: &str,
+        version: u64,
+        list_json: &str,
+    ) -> Result<bool> {
+        let version = i64::try_from(version).context("device list version is too large")?;
+        Ok(self.conn.execute(
+            "INSERT INTO device_lists (account_id, version, list_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id) DO UPDATE SET
+                 version    = excluded.version,
+                 list_json  = excluded.list_json,
+                 updated_at = excluded.updated_at
+             WHERE excluded.version > device_lists.version",
+            params![account_id, version, list_json, unix_now()],
+        )? > 0)
+    }
+
+    // ----- подключение нового устройства ----------------------------------
+
+    pub fn pending_link(&self) -> Result<Option<PendingLink>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT x_secret, sign_secret, name FROM pending_link WHERE id = 1",
+                [],
+                |r| {
+                    Ok(PendingLink {
+                        x_secret: blob32(r, 0)?,
+                        sign_secret: blob32(r, 1)?,
+                        name: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn set_pending_link(&self, link: &PendingLink) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending_link (id, x_secret, sign_secret, name, created_at)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 x_secret = excluded.x_secret, sign_secret = excluded.sign_secret,
+                 name = excluded.name, created_at = excluded.created_at",
+            params![
+                &link.x_secret[..],
+                &link.sign_secret[..],
+                link.name,
+                unix_now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_pending_link(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM pending_link", [])?;
+        Ok(())
     }
 
     pub fn list_contacts(&self) -> Result<Vec<ContactRow>> {
@@ -567,30 +683,175 @@ impl Db {
             .exists(params![peer_account_id, msg_id])?)
     }
 
+    // ----- исходящие конверты ----------------------------------------------
+
+    /// Положить конверт в исходящие (повтор того же конверта игнорируется).
+    pub fn insert_outbox(&self, item: &OutboxItem) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO outbox
+                 (message_id, peer_account_id, to_account_id, to_device_id, envelope_id,
+                  envelope_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                item.message_id,
+                item.peer_account_id,
+                item.to_account_id,
+                item.to_device_id,
+                item.envelope_id,
+                item.envelope_json,
+                unix_now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Конверты, которые ещё никто не подтвердил, от старых к новым.
+    pub fn list_outbox(&self, limit: usize) -> Result<Vec<OutboxItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT message_id, peer_account_id, to_account_id, to_device_id, envelope_id, envelope_json
+             FROM outbox ORDER BY created_at ASC, id ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(OutboxItem {
+                message_id: r.get(0)?,
+                peer_account_id: r.get(1)?,
+                to_account_id: r.get(2)?,
+                to_device_id: r.get(3)?,
+                envelope_id: r.get(4)?,
+                envelope_json: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Устройство подтвердило конверт: убрать его из исходящих. Если это
+    /// устройство собеседника, сообщение становится доставленным.
+    /// `None` — такого конверта в исходящих нет (повторное подтверждение).
+    pub fn ack_outbox(
+        &self,
+        to_account_id: &str,
+        to_device_id: u32,
+        envelope_id: &str,
+    ) -> Result<Option<Acked>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT message_id, peer_account_id FROM outbox
+                 WHERE to_account_id = ?1 AND to_device_id = ?2 AND envelope_id = ?3",
+                params![to_account_id, to_device_id, envelope_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((message_id, peer_account_id)) = row else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "DELETE FROM outbox WHERE to_account_id = ?1 AND to_device_id = ?2 AND envelope_id = ?3",
+            params![to_account_id, to_device_id, envelope_id],
+        )?;
+        let newly_delivered = to_account_id == peer_account_id
+            && self.mark_out_delivered(&peer_account_id, &message_id)?;
+        Ok(Some(Acked {
+            message_id,
+            peer_account_id,
+            newly_delivered,
+        }))
+    }
+
+    /// Убрать конверт из исходящих без отметки о доставке (его не доставить).
+    pub fn delete_outbox(
+        &self,
+        to_account_id: &str,
+        to_device_id: u32,
+        envelope_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM outbox WHERE to_account_id = ?1 AND to_device_id = ?2 AND envelope_id = ?3",
+            params![to_account_id, to_device_id, envelope_id],
+        )?;
+        Ok(())
+    }
+
+    /// Убрать из исходящих конверты для устройств аккаунта, которых больше
+    /// нет в его списке. Возвращает, сколько убрано.
+    pub fn drop_outbox_except(&self, to_account_id: &str, keep_devices: &[u32]) -> Result<usize> {
+        let mut dropped = 0;
+        for item in self.list_outbox(usize::MAX >> 1)? {
+            if item.to_account_id == to_account_id && !keep_devices.contains(&item.to_device_id) {
+                dropped += self.conn.execute(
+                    "DELETE FROM outbox WHERE to_account_id = ?1 AND to_device_id = ?2 AND envelope_id = ?3",
+                    params![item.to_account_id, item.to_device_id, item.envelope_id],
+                )?;
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// Видели ли мы уже конверт с этим ID от этого устройства. Повторную
+    /// доставку надо отсекать до расшифровки: ключ сообщения уже стёрт.
+    pub fn is_envelope_seen(
+        &self,
+        peer_account_id: &str,
+        peer_device_id: u32,
+        envelope_id: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM seen_envelopes
+                 WHERE peer_account_id = ?1 AND peer_device_id = ?2 AND envelope_id = ?3",
+            )?
+            .exists(params![peer_account_id, peer_device_id, envelope_id])?)
+    }
+
+    pub fn mark_envelope_seen(
+        &self,
+        peer_account_id: &str,
+        peer_device_id: u32,
+        envelope_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO seen_envelopes (peer_account_id, peer_device_id, envelope_id, seen_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![peer_account_id, peer_device_id, envelope_id, unix_now()],
+        )?;
+        Ok(())
+    }
+
     // ----- сессии ---------------------------------------------------------
 
-    /// Состояние сессий с собеседником (непрозрачный JSON из `crypto_core`).
-    pub fn load_sessions(&self, peer_account_id: &str) -> Result<Option<String>> {
+    /// Состояние сессий с устройством собеседника (непрозрачный JSON из `crypto_core`).
+    pub fn load_sessions(
+        &self,
+        peer_account_id: &str,
+        peer_device_id: u32,
+    ) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT state FROM sessions WHERE peer_account_id = ?1",
-                params![peer_account_id],
+                "SELECT state FROM sessions WHERE peer_account_id = ?1 AND peer_device_id = ?2",
+                params![peer_account_id, peer_device_id],
                 |r| r.get(0),
             )
             .optional()?)
     }
 
-    pub fn save_sessions(&self, peer_account_id: &str, state: &str) -> Result<()> {
+    pub fn save_sessions(
+        &self,
+        peer_account_id: &str,
+        peer_device_id: u32,
+        state: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sessions (peer_account_id, state, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(peer_account_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
-            params![peer_account_id, state, unix_now()],
+            "INSERT INTO sessions (peer_account_id, peer_device_id, state, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(peer_account_id, peer_device_id)
+             DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+            params![peer_account_id, peer_device_id, state, unix_now()],
         )?;
         Ok(())
     }
 
-    /// Забыть сессии с собеседником (например, при удалении контакта).
+    /// Забыть сессии со всеми устройствами собеседника (например, при удалении контакта).
     pub fn delete_sessions(&self, peer_account_id: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM sessions WHERE peer_account_id = ?1",
@@ -599,18 +860,41 @@ impl Db {
         Ok(())
     }
 
-    /// Встречался ли уже этот одноразовый ключ X3DH от собеседника.
-    pub fn is_ek_used(&self, peer_account_id: &str, ek: &[u8; 32]) -> Result<bool> {
-        Ok(self
-            .conn
-            .prepare_cached("SELECT 1 FROM used_prekey_eks WHERE peer_account_id = ?1 AND ek = ?2")?
-            .exists(params![peer_account_id, &ek[..]])?)
+    /// Забыть сессии с одним устройством (его отключили от аккаунта).
+    pub fn delete_device_sessions(&self, peer_account_id: &str, peer_device_id: u32) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sessions WHERE peer_account_id = ?1 AND peer_device_id = ?2",
+            params![peer_account_id, peer_device_id],
+        )?;
+        Ok(())
     }
 
-    pub fn mark_ek_used(&self, peer_account_id: &str, ek: &[u8; 32]) -> Result<()> {
+    /// Встречался ли уже этот одноразовый ключ X3DH от устройства собеседника.
+    pub fn is_ek_used(
+        &self,
+        peer_account_id: &str,
+        peer_device_id: u32,
+        ek: &[u8; 32],
+    ) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM used_prekey_eks
+                 WHERE peer_account_id = ?1 AND peer_device_id = ?2 AND ek = ?3",
+            )?
+            .exists(params![peer_account_id, peer_device_id, &ek[..]])?)
+    }
+
+    pub fn mark_ek_used(
+        &self,
+        peer_account_id: &str,
+        peer_device_id: u32,
+        ek: &[u8; 32],
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO used_prekey_eks (peer_account_id, ek, used_at) VALUES (?1, ?2, ?3)",
-            params![peer_account_id, &ek[..], unix_now()],
+            "INSERT OR IGNORE INTO used_prekey_eks (peer_account_id, peer_device_id, ek, used_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![peer_account_id, peer_device_id, &ek[..], unix_now()],
         )?;
         Ok(())
     }
@@ -729,24 +1013,6 @@ impl Db {
             .conn
             .query_row("SELECT COUNT(1) FROM one_time_prekeys", [], |r| r.get(0))?)
     }
-
-    /// Исходящие сообщения, которые получатель ещё не подтвердил.
-    pub fn list_pending_outgoing(&self, limit: usize) -> Result<Vec<PendingOutgoing>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT peer_account_id, msg_id, envelope_json FROM messages
-             WHERE direction = 1 AND msg_id IS NOT NULL AND status = 0
-             ORDER BY created_at ASC, id ASC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
-            Ok(PendingOutgoing {
-                peer_account_id: r.get(0)?,
-                msg_id: r.get(1)?,
-                envelope_json: r.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -791,12 +1057,8 @@ const SCHEMA_V3: &str = "
 ";
 
 /// v4: прямая секретность (X3DH + Double Ratchet).
+/// (Таблицы `sessions` и `used_prekey_eks` из v4 с v5 устроены иначе — см. [`SESSIONS_V5`].)
 const SCHEMA_V4: &str = "
-    CREATE TABLE IF NOT EXISTS sessions (
-        peer_account_id TEXT PRIMARY KEY,
-        state           TEXT NOT NULL,
-        updated_at      INTEGER NOT NULL
-    );
     CREATE TABLE IF NOT EXISTS signed_prekeys (
         id         INTEGER PRIMARY KEY,
         secret     BLOB NOT NULL,
@@ -810,15 +1072,62 @@ const SCHEMA_V4: &str = "
         public     BLOB NOT NULL,
         created_at INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS used_prekey_eks (
-        peer_account_id TEXT NOT NULL,
-        ek              BLOB NOT NULL,
-        used_at         INTEGER NOT NULL,
-        PRIMARY KEY (peer_account_id, ek)
-    );
     CREATE TABLE IF NOT EXISTS counters (
         name  TEXT PRIMARY KEY,
         value INTEGER NOT NULL
+    );
+";
+
+/// v5: несколько устройств на аккаунт.
+const SCHEMA_V5: &str = "
+    CREATE TABLE IF NOT EXISTS device_lists (
+        account_id TEXT PRIMARY KEY,
+        version    INTEGER NOT NULL,
+        list_json  TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS outbox (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id      TEXT NOT NULL,
+        peer_account_id TEXT NOT NULL,
+        to_account_id   TEXT NOT NULL,
+        to_device_id    INTEGER NOT NULL,
+        envelope_id     TEXT NOT NULL,
+        envelope_json   TEXT NOT NULL,
+        created_at      INTEGER NOT NULL,
+        UNIQUE (to_account_id, to_device_id, envelope_id)
+    );
+    CREATE TABLE IF NOT EXISTS seen_envelopes (
+        peer_account_id TEXT NOT NULL,
+        peer_device_id  INTEGER NOT NULL,
+        envelope_id     TEXT NOT NULL,
+        seen_at         INTEGER NOT NULL,
+        PRIMARY KEY (peer_account_id, peer_device_id, envelope_id)
+    );
+    CREATE TABLE IF NOT EXISTS pending_link (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        x_secret    BLOB NOT NULL,
+        sign_secret BLOB NOT NULL,
+        name        TEXT NOT NULL,
+        created_at  INTEGER NOT NULL
+    );
+";
+
+/// Сессии и метки X3DH v5: ключ — (собеседник, его устройство).
+const SESSIONS_V5: &str = "
+    CREATE TABLE sessions (
+        peer_account_id TEXT NOT NULL,
+        peer_device_id  INTEGER NOT NULL,
+        state           TEXT NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        PRIMARY KEY (peer_account_id, peer_device_id)
+    );
+    CREATE TABLE used_prekey_eks (
+        peer_account_id TEXT NOT NULL,
+        peer_device_id  INTEGER NOT NULL,
+        ek              BLOB NOT NULL,
+        used_at         INTEGER NOT NULL,
+        PRIMARY KEY (peer_account_id, peer_device_id, ek)
     );
 ";
 
@@ -853,7 +1162,28 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
 
     tx.execute_batch(SCHEMA_V3)?;
+    if !column_exists(&tx, "sessions", "peer_device_id")? {
+        if table_exists(&tx, "sessions")? {
+            // v4 → v5: всё, что было, — с основным устройством собеседника.
+            tx.execute_batch(
+                "ALTER TABLE sessions RENAME TO sessions_v4;
+                 ALTER TABLE used_prekey_eks RENAME TO used_prekey_eks_v4;",
+            )?;
+            tx.execute_batch(SESSIONS_V5)?;
+            tx.execute_batch(
+                "INSERT INTO sessions (peer_account_id, peer_device_id, state, updated_at)
+                     SELECT peer_account_id, 1, state, updated_at FROM sessions_v4;
+                 INSERT INTO used_prekey_eks (peer_account_id, peer_device_id, ek, used_at)
+                     SELECT peer_account_id, 1, ek, used_at FROM used_prekey_eks_v4;
+                 DROP TABLE sessions_v4;
+                 DROP TABLE used_prekey_eks_v4;",
+            )?;
+        } else {
+            tx.execute_batch(SESSIONS_V5)?;
+        }
+    }
     tx.execute_batch(SCHEMA_V4)?;
+    tx.execute_batch(SCHEMA_V5)?;
 
     // Колонки, которые появлялись по ходу развития.
     for (table, column, ddl) in [
@@ -907,6 +1237,11 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             "spk_sig",
             "ALTER TABLE contacts ADD COLUMN spk_sig BLOB NULL",
         ),
+        (
+            "identities",
+            "device_id",
+            "ALTER TABLE identities ADD COLUMN device_id INTEGER NOT NULL DEFAULT 1",
+        ),
     ] {
         if !column_exists(&tx, table, column)? {
             tx.execute_batch(ddl)?;
@@ -921,6 +1256,13 @@ fn migrate(conn: &mut Connection) -> Result<()> {
          CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_peer_dir_msg_id
              ON messages(peer_account_id, direction, msg_id);",
     )?;
+
+    if version < 5 {
+        // Неотправленное до v5 зашифровано старым форматом конверта: новый релей
+        // его не примет. Честно помечаем «не отправлено» — пусть пользователь
+        // отправит заново.
+        tx.execute_batch("UPDATE messages SET status = 2 WHERE direction = 1 AND status = 0")?;
+    }
 
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;

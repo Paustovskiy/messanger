@@ -34,12 +34,14 @@ use x25519_dalek::{PublicKey, StaticSecret};
 pub const MAX_SESSIONS: usize = 5;
 
 const INFO_X3DH: &[u8] = b"messenger/x3dh/v1";
-const DOMAIN_AD: &[u8] = b"messenger/x3dh-ad/v1";
+const DOMAIN_AD: &[u8] = b"messenger/x3dh-ad/v2";
 
 /// Публичные ключи собеседника из *нашей* базы контактов.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerKeys {
     pub account_id: String,
+    /// Номер устройства собеседника: сессии у каждого устройства свои.
+    pub device_id: u32,
     /// Постоянный X25519-ключ (identity key).
     pub x25519_pub: [u8; 32],
     /// Ключ подписи Ed25519.
@@ -147,20 +149,16 @@ impl SessionSet {
     }
 }
 
-/// X3DH associated data: инициатор, затем ответчик.
-fn x3dh_ad(
-    initiator: &str,
-    initiator_ik: &[u8; 32],
-    responder: &str,
-    responder_ik: &[u8; 32],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(DOMAIN_AD.len() + 64 + initiator.len() + responder.len() + 16);
+/// X3DH associated data: инициатор, затем ответчик (аккаунт, устройство, ключ).
+fn x3dh_ad(initiator: (&str, u32, &[u8; 32]), responder: (&str, u32, &[u8; 32])) -> Vec<u8> {
+    let mut out = Vec::with_capacity(DOMAIN_AD.len() + 96 + initiator.0.len() + responder.0.len());
     out.extend_from_slice(DOMAIN_AD);
-    out.extend_from_slice(initiator_ik);
-    out.extend_from_slice(responder_ik);
-    for id in [initiator, responder] {
+    out.extend_from_slice(initiator.2);
+    out.extend_from_slice(responder.2);
+    for (id, device, _) in [initiator, responder] {
         out.extend_from_slice(&(id.len() as u64).to_le_bytes());
         out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(&device.to_le_bytes());
     }
     out
 }
@@ -233,10 +231,8 @@ impl Identity {
         sessions.push_front(Session {
             ratchet: Ratchet::init_initiator(sk, spk)?,
             ad: x3dh_ad(
-                self.account_id(),
-                &self.x_public_bytes(),
-                &peer.account_id,
-                &peer.x25519_pub,
+                (self.account_id(), self.device_id(), &self.x_public_bytes()),
+                (&peer.account_id, peer.device_id, &peer.x25519_pub),
             ),
             pending_prekey: Some(PendingPrekey {
                 ek_pub,
@@ -274,7 +270,9 @@ impl Identity {
         });
         let header_bytes = envelope_header_bytes(
             self.account_id(),
+            self.device_id(),
             &peer.account_id,
+            peer.device_id,
             prekey.as_ref(),
             &header,
         );
@@ -283,7 +281,9 @@ impl Identity {
 
         let mut env = Envelope {
             from: self.account_id().to_owned(),
+            from_device: self.device_id(),
             to: peer.account_id.clone(),
+            to_device: peer.device_id,
             prekey,
             header,
             body,
@@ -305,10 +305,13 @@ impl Identity {
         env: &Envelope,
         prekeys: &PrekeySecrets,
     ) -> Result<Opened, CryptoError> {
-        if env.to != self.account_id() {
-            return Err(CryptoError::WrongRecipient(env.to.clone()));
+        if env.to != self.account_id() || env.to_device != self.device_id() {
+            return Err(CryptoError::WrongRecipient(format!(
+                "{}/{}",
+                env.to, env.to_device
+            )));
         }
-        if env.from != peer.account_id {
+        if env.from != peer.account_id || env.from_device != peer.device_id {
             return Err(CryptoError::BadSignature);
         }
         crate::verify_envelope(env, &peer.ed25519_pub)?;
@@ -356,16 +359,17 @@ impl Identity {
         let mut s = Session {
             ratchet: Ratchet::init_responder(sk, spk_secret),
             ad: x3dh_ad(
-                &peer.account_id,
-                &peer.x25519_pub,
-                self.account_id(),
-                &self.x_public_bytes(),
+                (&peer.account_id, peer.device_id, &peer.x25519_pub),
+                (self.account_id(), self.device_id(), &self.x_public_bytes()),
             ),
             pending_prekey: None,
         };
         let aad = [s.ad.as_slice(), &header_bytes].concat();
         let plaintext = s.ratchet.decrypt(&env.header, &env.body, &aad)?;
-        sessions.insert_incoming(s, peer.account_id.as_str() < self.account_id());
+        // Ничья при одновременном старте — по (аккаунт, устройство).
+        let peer_wins =
+            (peer.account_id.as_str(), peer.device_id) < (self.account_id(), self.device_id());
+        sessions.insert_incoming(s, peer_wins);
         Ok(Opened {
             plaintext,
             new_session_ek: Some(pk.ek_pub),
