@@ -599,3 +599,47 @@ fn second_device_joins_receives_and_is_unlinked() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Номер отключённого устройства не выдаётся заново, даже если оно было с
+/// наибольшим номером.
+#[test]
+fn unlinked_device_number_is_not_reused() {
+    let dir = tmp_dir("devices-reuse");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    bob.ok(&["set-username", "bobby"]);
+
+    let link = |name: &str| -> String {
+        let phone = User::new(&dir, name, &relay);
+        let out = phone.run(&["link", "--name", name]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let response = dir.join(format!("{name}.json"));
+        bob.ok(&[
+            "link-approve",
+            &code,
+            "--yes",
+            "-o",
+            response.to_str().unwrap(),
+        ]);
+        phone.ok(&["link-finish", "--response-file", response.to_str().unwrap()])
+    };
+
+    let first = link("phone-a");
+    let number = |text: &str| -> String {
+        let at = text.find("устройство №").expect("номер в выводе");
+        text[at..]
+            .chars()
+            .skip("устройство №".chars().count())
+            .take_while(char::is_ascii_digit)
+            .collect()
+    };
+    let n1 = number(&first);
+    bob.ok(&["unlink", &n1]);
+    let second = link("phone-b");
+    let n2 = number(&second);
+    assert_ne!(n1, n2, "номер отключённого устройства выдан повторно");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

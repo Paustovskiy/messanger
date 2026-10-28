@@ -1114,14 +1114,26 @@ fn cmd_link_approve(
         }
     }
 
-    let device_id = list.devices.iter().map(|d| d.device_id).max().unwrap_or(0) + 1;
+    list.version += 1;
+    // Номер не должен совпасть с номером уже отключённого устройства, а в списке
+    // отключённых нет. Версия списка растёт при каждом изменении (и добавлении, и
+    // отключении), поэтому номер не меньше новой версии никогда не повторится.
+    let by_version = u32::try_from(list.version).context("слишком много изменений списка")?;
+    let after_max = list
+        .devices
+        .iter()
+        .map(|d| d.device_id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .context("закончились номера устройств")?;
+    let device_id = by_version.max(after_max);
     list.devices.push(DeviceInfo {
         device_id,
         x25519_pub,
         ed25519_pub,
         name: req.name.clone(),
     });
-    list.version += 1;
     let wire = devices::save_own(db, &me, &list)?;
 
     let mut contacts = vec![];
