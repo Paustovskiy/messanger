@@ -49,13 +49,13 @@ pub fn check_account_key(db: &Db, me: &Identity) -> Result<()> {
             me.account_id()
         );
     }
-    if let Some((list, _)) = stored(db, me.account_id())?
-        && list.account_pub != public
-    {
-        bail!(
-            "ключ аккаунта на этом устройстве не совпадает с ключом в сохранённом списке \
-             устройств; база повреждена или подменена, работа остановлена"
-        );
+    if let Some((list, _)) = stored(db, me.account_id())? {
+        if list.account_pub != public {
+            bail!(
+                "ключ аккаунта на этом устройстве не совпадает с ключом в сохранённом списке \
+                 устройств; база повреждена или подменена, работа остановлена"
+            );
+        }
     }
     Ok(())
 }
