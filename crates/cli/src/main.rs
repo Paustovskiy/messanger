@@ -1,5 +1,6 @@
 //! `messenger` — консольный клиент.
 
+mod backup;
 mod devices;
 mod display;
 mod messaging;
@@ -185,6 +186,19 @@ enum Command {
         response_file: Option<PathBuf>,
     },
 
+    /// Сделать резервную копию ключа аккаунта в файл и показать код для записи на бумагу.
+    BackupKey {
+        /// Куда записать файл копии.
+        #[arg(long, short)]
+        out: PathBuf,
+        /// Заменить файл, если он уже есть.
+        #[arg(long)]
+        force: bool,
+        /// Разрешить вывод, перенаправленный в файл или канал (код попадёт туда же).
+        #[arg(long)]
+        allow_redirect: bool,
+    },
+
     /// На основном устройстве: отключить устройство от аккаунта.
     Unlink {
         /// Номер устройства (см. `messenger devices`).
@@ -260,6 +274,11 @@ fn run() -> Result<()> {
             response,
             response_file,
         } => cmd_link_finish(&db, response, response_file),
+        Command::BackupKey {
+            out,
+            force,
+            allow_redirect,
+        } => backup::cmd_backup_key(&db, &out, force, allow_redirect),
         Command::Unlink { device_id } => cmd_unlink(&db, &cli.relay, device_id),
     }
 }
@@ -298,8 +317,12 @@ fn load_identity(db: &Db) -> Result<(IdentityRow, Identity)> {
         }
     };
 
-    let id =
+    let mut id =
         Identity::from_secrets(&row.account_id, row.secret, sign_secret).with_device(row.device_id);
+    if let Some(account_secret) = row.account_sign_secret {
+        id = id.with_account_key(account_secret);
+    }
+    devices::check_account_key(db, &id)?;
     if id.device_id() == PRIMARY_DEVICE {
         devices::own_list(db, &id)?;
     }
@@ -385,6 +408,7 @@ fn create_identity(db: &Db, profile: &str, encrypted: bool) -> Result<()> {
         public: id.x_public_bytes(),
         sign_secret: Some(id.sign_secret_bytes()),
         sign_public: Some(id.sign_public_bytes()),
+        account_sign_secret: None,
     })?;
     messaging::ensure_signed_prekey(db, &id)?;
     devices::own_list(db, &id)?;
@@ -1244,6 +1268,7 @@ fn cmd_link_finish(db: &Db, response: Option<String>, file: Option<PathBuf>) -> 
             public: me.x_public_bytes(),
             sign_secret: Some(me.sign_secret_bytes()),
             sign_public: Some(me.sign_public_bytes()),
+            account_sign_secret: None,
         })?;
         // Список уже проверен: подпись ключом аккаунта и сам ID.
         db.save_device_list(

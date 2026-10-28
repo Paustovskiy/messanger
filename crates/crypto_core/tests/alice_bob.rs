@@ -653,3 +653,137 @@ fn legacy_account_lists_need_a_known_key() {
     let pk = legacy.sign_public_bytes();
     assert!(crypto_core::verify_device_list(&signed, legacy.account_id(), Some(&pk)).is_ok());
 }
+
+/// Устройство №2 с ключом аккаунта из резервной копии.
+fn restored_device(primary: &Identity, device_id: u32) -> Identity {
+    Identity::generate(primary.account_id())
+        .with_device(device_id)
+        .with_account_key(primary.sign_secret_bytes())
+}
+
+#[test]
+fn account_key_flags() {
+    let primary = Identity::generate_new();
+    let phone = second_device(&primary, 2);
+    assert!(primary.has_account_key());
+    assert!(!phone.has_account_key());
+    assert_eq!(phone.account_public_bytes(), None);
+    assert_eq!(phone.sign_as_account(b"x"), Err(CryptoError::NotAccountKey));
+    // У №1 дополнительное поле не нужно, вызов ничего не меняет.
+    let same = primary
+        .clone()
+        .with_account_key(Identity::generate_new().sign_secret_bytes());
+    assert_eq!(same.account_public_bytes(), primary.account_public_bytes());
+    assert_eq!(same.account_sign_secret_bytes(), None);
+    assert_eq!(same.sign(b"m"), primary.sign(b"m"));
+
+    let restored = restored_device(&primary, 2);
+    assert!(restored.has_account_key());
+    assert_eq!(
+        restored.account_public_bytes(),
+        Some(primary.sign_public_bytes())
+    );
+    assert_eq!(
+        restored.account_sign_secret_bytes(),
+        Some(primary.sign_secret_bytes())
+    );
+    // Своя подпись устройства осталась своей.
+    assert_ne!(restored.sign_public_bytes(), primary.sign_public_bytes());
+    let sig = restored.sign_as_account(b"data").unwrap();
+    assert!(crypto_core::verify_signature(
+        &primary.sign_public_bytes(),
+        b"data",
+        &sig
+    ));
+    // Debug не печатает секрет.
+    let dbg = format!("{restored:?}");
+    assert!(!dbg.contains("account_sign"), "{dbg}");
+}
+
+#[test]
+fn restored_device_signs_next_list_and_peer_accepts_it() {
+    let primary = Identity::generate_new();
+    let phone = second_device(&primary, 2);
+    let v2 = device_list(&primary, &[&phone], 2);
+    primary.sign_device_list(&v2).unwrap();
+
+    // Утрата №1; новое устройство №3 с ключом аккаунта публикует v3.
+    let restored = restored_device(&primary, 3);
+    let mut v3 = v2.clone();
+    v3.version = 3;
+    v3.devices.push(restored.device_info("восстановленное"));
+    let wire = restored.sign_device_list(&v3).unwrap();
+
+    // Собеседник знает ключ аккаунта по карточке и принимает список.
+    let pk = primary.sign_public_bytes();
+    let got = crypto_core::verify_device_list(&wire, primary.account_id(), Some(&pk)).unwrap();
+    assert_eq!(got, v3);
+    assert!(protocol::backup::check_list_update(Some(&v2), &got).is_ok());
+    // Подпись настоящая подпись аккаунта: проверяется и без известного ключа.
+    assert!(crypto_core::verify_device_list(&wire, primary.account_id(), None).is_ok());
+}
+
+#[test]
+fn restored_device_cannot_swap_primary_or_roll_back() {
+    let primary = Identity::generate_new();
+    let phone = second_device(&primary, 2);
+    let v2 = device_list(&primary, &[&phone], 2);
+    let restored = restored_device(&primary, 3);
+
+    // Подмена записи №1 подписана верно, но правило обновления её отвергает.
+    let mut swapped = v2.clone();
+    swapped.version = 3;
+    swapped.devices[0].x25519_pub = restored.x_public_bytes();
+    let wire = restored.sign_device_list(&swapped).unwrap();
+    let pk = primary.sign_public_bytes();
+    let got = crypto_core::verify_device_list(&wire, primary.account_id(), Some(&pk)).unwrap();
+    assert!(protocol::backup::check_list_update(Some(&v2), &got).is_err());
+
+    let mut renamed = v2.clone();
+    renamed.version = 3;
+    renamed.devices[0].name = "чужое имя".into();
+    assert!(protocol::backup::check_list_update(Some(&v2), &renamed).is_err());
+
+    // Откат версии.
+    let mut old = v2.clone();
+    old.version = 1;
+    let wire = restored.sign_device_list(&old).unwrap();
+    let got = crypto_core::verify_device_list(&wire, primary.account_id(), Some(&pk)).unwrap();
+    assert!(protocol::backup::check_list_update(Some(&v2), &got).is_err());
+
+    // Список чужого аккаунта подписать нельзя.
+    let mallory = Identity::generate_new();
+    let foreign = device_list(&mallory, &[], 5);
+    assert_eq!(
+        restored.sign_device_list(&foreign),
+        Err(CryptoError::NotAccountKey)
+    );
+}
+
+#[test]
+fn restored_device_card_verifies() {
+    let primary = Identity::generate_new();
+    let restored = restored_device(&primary, 2);
+    let card = restored
+        .account_contact_card(Some("@alice".into()), primary.x_public_bytes())
+        .unwrap();
+    assert!(card.signed_prekey.is_none());
+    let v = verify_contact_card(&card).unwrap();
+    assert_eq!(v.account_id, primary.account_id());
+    assert_eq!(v.ed25519_pub, primary.sign_public_bytes());
+    assert_eq!(v.x25519_pub, primary.x_public_bytes());
+    assert_eq!(v.fingerprint(), primary.fingerprint());
+
+    // Для №1 то же, что обычная карточка (X25519 берётся свой).
+    let own = primary
+        .account_contact_card(Some("@alice".into()), [9; 32])
+        .unwrap();
+    assert_eq!(own, primary.contact_card(Some("@alice".into())));
+
+    // Устройство без ключа аккаунта карточку выпустить не может.
+    let phone = second_device(&primary, 3);
+    assert_eq!(
+        phone.account_contact_card(None, primary.x_public_bytes()),
+        Err(CryptoError::NotAccountKey)
+    );
+}

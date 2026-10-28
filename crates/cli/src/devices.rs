@@ -31,6 +31,35 @@ pub fn stored(db: &Db, account_id: &str) -> Result<Option<(DeviceList, SignedDev
     Ok(Some((list, wire)))
 }
 
+/// Сверить ключ аккаунта на устройстве с тем, что известно о своём аккаунте независимо
+/// от этого ключа. Если account_id выводится из ключа (32 hex), он обязан совпасть с
+/// ключом: чужой ключ не подойдёт к чужому ID. Старые аккаунты с ID в виде UUID так не
+/// проверить (их ID не связан с ключом), для них эта сверка пропускается. Если у
+/// устройства уже есть сохранённый свой список, его `account_pub` должен совпасть в
+/// любом случае. Иначе база повреждена или подменена, и работать с таким ключом
+/// нельзя: подписи вышли бы не тем ключом.
+pub fn check_account_key(db: &Db, me: &Identity) -> Result<()> {
+    let Some(public) = me.account_public_bytes() else {
+        return Ok(());
+    };
+    if crypto_core::check_account_id(me.account_id(), &public).is_err() {
+        bail!(
+            "ключ аккаунта на этом устройстве не подходит к account_id {}: база повреждена \
+             или ключ из чужой копии; работа остановлена",
+            me.account_id()
+        );
+    }
+    if let Some((list, _)) = stored(db, me.account_id())?
+        && list.account_pub != public
+    {
+        bail!(
+            "ключ аккаунта на этом устройстве не совпадает с ключом в сохранённом списке \
+             устройств; база повреждена или подменена, работа остановлена"
+        );
+    }
+    Ok(())
+}
+
 /// Свой список устройств. Основное устройство при первом обращении заводит
 /// его само (так обновляются аккаунты, созданные до появления устройств).
 pub fn own_list(db: &Db, me: &Identity) -> Result<(DeviceList, SignedDeviceListB64)> {
@@ -295,5 +324,108 @@ impl LinkResponse {
             bail!("ответ на подключение подписан не владельцем аккаунта");
         }
         Ok((payload, list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device_with_key(primary: &Identity, key: &Identity) -> Identity {
+        Identity::generate(primary.account_id())
+            .with_device(2)
+            .with_account_key(key.sign_secret_bytes())
+    }
+
+    #[test]
+    fn matching_account_key_is_accepted() {
+        let db = Db::open_in_memory().unwrap();
+        let primary = Identity::generate_new();
+        own_list(&db, &primary).unwrap();
+        check_account_key(&db, &primary).unwrap();
+        let dev = device_with_key(&primary, &primary);
+        check_account_key(&db, &dev).unwrap();
+        // Устройство без ключа аккаунта проверять нечего.
+        check_account_key(
+            &db,
+            &Identity::generate(primary.account_id()).with_device(2),
+        )
+        .unwrap();
+    }
+
+    const LEGACY_UUID: &str = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
+
+    #[test]
+    fn legacy_uuid_account_with_stored_list_is_accepted() {
+        let db = Db::open_in_memory().unwrap();
+        let me = Identity::generate(LEGACY_UUID);
+        own_list(&db, &me).unwrap();
+        check_account_key(&db, &me).unwrap();
+    }
+
+    #[test]
+    fn legacy_uuid_account_without_list_is_accepted() {
+        let db = Db::open_in_memory().unwrap();
+        let me = Identity::generate(LEGACY_UUID);
+        check_account_key(&db, &me).unwrap();
+    }
+
+    #[test]
+    fn legacy_uuid_account_foreign_key_on_device_2_is_rejected() {
+        let db = Db::open_in_memory().unwrap();
+        let primary = Identity::generate(LEGACY_UUID);
+        own_list(&db, &primary).unwrap();
+        let other = Identity::generate_new();
+        let dev = device_with_key(&primary, &other);
+        let err = check_account_key(&db, &dev).unwrap_err().to_string();
+        assert!(err.contains("не совпадает"), "{err}");
+    }
+
+    /// UUID-аккаунт, устройство №2 без списка, ключ чужой: сверка с ID для UUID
+    /// невозможна и проходит, но списка нет, так что own_list (а с ним и backup-key)
+    /// отказывает.
+    #[test]
+    fn legacy_uuid_device_without_list_and_foreign_key_cannot_get_own_list() {
+        let db = Db::open_in_memory().unwrap();
+        let primary = Identity::generate(LEGACY_UUID);
+        let other = Identity::generate_new();
+        let dev = device_with_key(&primary, &other);
+        check_account_key(&db, &dev).unwrap();
+        let err = own_list(&db, &dev).unwrap_err().to_string();
+        assert!(err.contains("нет списка устройств"), "{err}");
+    }
+
+    #[test]
+    fn foreign_account_key_is_rejected_without_list() {
+        let db = Db::open_in_memory().unwrap();
+        let primary = Identity::generate_new();
+        let other = Identity::generate_new();
+        let dev = device_with_key(&primary, &other);
+        let err = check_account_key(&db, &dev).unwrap_err().to_string();
+        assert!(err.contains("не подходит к account_id"), "{err}");
+    }
+
+    #[test]
+    fn account_key_not_matching_stored_list_is_rejected() {
+        let db = Db::open_in_memory().unwrap();
+        let primary = Identity::generate_new();
+        let other = Identity::generate_new();
+        // Сохранённый «свой» список с чужим account_pub.
+        let list = DeviceList {
+            account_id: other.account_id().into(),
+            account_pub: other.sign_public_bytes(),
+            version: 1,
+            devices: vec![other.device_info(PRIMARY_NAME)],
+        };
+        let wire = other.sign_device_list(&list).unwrap();
+        db.save_device_list(
+            primary.account_id(),
+            1,
+            &serde_json::to_string(&wire).unwrap(),
+        )
+        .unwrap();
+        let dev = device_with_key(&primary, &primary);
+        let err = check_account_key(&db, &dev).unwrap_err().to_string();
+        assert!(err.contains("не совпадает"), "{err}");
     }
 }

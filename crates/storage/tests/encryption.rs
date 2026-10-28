@@ -233,3 +233,60 @@ fn reencrypt_refuses_while_database_is_open_elsewhere() {
     reencrypt(&path, None, Some("pw")).unwrap();
     assert_eq!(read_secret(&Db::open(&path, Some("pw")).unwrap()), SECRET);
 }
+
+/// Ключ аккаунта и данные восстановления лежат на диске только зашифрованными.
+#[test]
+fn account_key_is_not_visible_on_disk() {
+    let key = [0xA7u8; 32];
+    let restore_key = [0xB9u8; 32];
+    let fill = |db: &Db| {
+        db.upsert_identity(&IdentityRow {
+            account_id: "acc".into(),
+            device_id: 2,
+            username: None,
+            secret: [0x11; 32],
+            public: [0x12; 32],
+            sign_secret: Some([0x13; 32]),
+            sign_public: Some([0x14; 32]),
+            account_sign_secret: Some(key),
+        })
+        .unwrap();
+        db.set_pending_restore(&PendingRestore {
+            account_id: "acc".into(),
+            account_secret: restore_key,
+            x_secret: [0x15; 32],
+            sign_secret: [0x16; 32],
+            name: "n".into(),
+        })
+        .unwrap();
+    };
+    let has = |bytes: &[u8], k: &[u8; 32]| bytes.windows(32).any(|w| w == k);
+
+    // Контроль: в открытой базе ключи видны, значит проверка что-то проверяет.
+    let plain = tmp_path("acc-key-plain");
+    {
+        let db = Db::open(&plain, None).unwrap();
+        fill(&db);
+        let raw = raw_bytes(&plain);
+        assert!(has(&raw, &key) && has(&raw, &restore_key));
+    }
+
+    let path = tmp_path("acc-key-enc");
+    let db = Db::open(&path, Some("пароль")).unwrap();
+    fill(&db);
+    let raw = raw_bytes(&path);
+    assert!(!has(&raw, &key), "ключ аккаунта виден на диске");
+    assert!(
+        !has(&raw, &restore_key),
+        "ключ из pending_restore виден на диске"
+    );
+    drop(db);
+    let db = Db::open(&path, Some("пароль")).unwrap();
+    assert_eq!(
+        db.get_local_identity()
+            .unwrap()
+            .unwrap()
+            .account_sign_secret,
+        Some(key)
+    );
+}

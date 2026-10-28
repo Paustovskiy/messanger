@@ -9,6 +9,8 @@
 //! (длина `u64 LE` + байты), а не через serde — чтобы подпись не зависела от
 //! версии сериализатора.
 
+pub mod backup;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
