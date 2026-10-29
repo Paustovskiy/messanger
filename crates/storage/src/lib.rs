@@ -26,7 +26,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub mod encryption;
 pub use encryption::{FileState, PasswordRequired, WrongPassword, file_state, reencrypt};
@@ -393,12 +393,12 @@ impl Db {
                     Ok(IdentityRow {
                         account_id: r.get(0)?,
                         username: r.get(1)?,
-                        secret: blob32(r, 2)?,
+                        secret: secret32(r, 2)?,
                         public: blob32(r, 3)?,
-                        sign_secret: blob32_opt(r, 4)?,
+                        sign_secret: secret32_opt(r, 4)?,
                         sign_public: blob32_opt(r, 5)?,
                         device_id: r.get(6)?,
-                        account_sign_secret: blob32_opt(r, 7)?,
+                        account_sign_secret: secret32_opt(r, 7)?,
                     })
                 },
             )
@@ -555,8 +555,8 @@ impl Db {
                 [],
                 |r| {
                     Ok(PendingLink {
-                        x_secret: blob32(r, 0)?,
-                        sign_secret: blob32(r, 1)?,
+                        x_secret: secret32(r, 0)?,
+                        sign_secret: secret32(r, 1)?,
                         name: r.get(2)?,
                     })
                 },
@@ -598,9 +598,9 @@ impl Db {
                 |r| {
                     Ok(PendingRestore {
                         account_id: r.get(0)?,
-                        account_secret: blob32(r, 1)?,
-                        x_secret: blob32(r, 2)?,
-                        sign_secret: blob32(r, 3)?,
+                        account_secret: secret32(r, 1)?,
+                        x_secret: secret32(r, 2)?,
+                        sign_secret: secret32(r, 3)?,
                         name: r.get(4)?,
                     })
                 },
@@ -1074,7 +1074,7 @@ impl Db {
                 |r| {
                     Ok(OwnSignedPrekey {
                         id: r.get(0)?,
-                        secret: blob32(r, 1)?,
+                        secret: secret32(r, 1)?,
                         public: blob32(r, 2)?,
                         sig: blob64(r, 3)?,
                         created_at: r.get(4)?,
@@ -1090,7 +1090,7 @@ impl Db {
             .query_row(
                 "SELECT secret FROM signed_prekeys WHERE id = ?1",
                 params![id],
-                |r| blob32(r, 0),
+                |r| secret32(r, 0),
             )
             .optional()?)
     }
@@ -1144,7 +1144,7 @@ impl Db {
             .query_row(
                 "SELECT secret FROM one_time_prekeys WHERE id = ?1",
                 params![id],
-                |r| blob32(r, 0),
+                |r| secret32(r, 0),
             )
             .optional()?)
     }
@@ -1513,6 +1513,30 @@ fn to32(v: Vec<u8>, idx: usize) -> rusqlite::Result<[u8; 32]> {
             format!("expected 32-byte key, got {} bytes", v.len()).into(),
         )
     })
+}
+
+/// Секретное 32-байтовое поле: промежуточный буфер затирается при любом исходе.
+fn secret32(r: &Row<'_>, idx: usize) -> rusqlite::Result<[u8; 32]> {
+    let v: Zeroizing<Vec<u8>> = Zeroizing::new(r.get(idx)?);
+    secret_to32(&v, idx)
+}
+
+fn secret32_opt(r: &Row<'_>, idx: usize) -> rusqlite::Result<Option<[u8; 32]>> {
+    let v: Option<Zeroizing<Vec<u8>>> = r.get::<_, Option<Vec<u8>>>(idx)?.map(Zeroizing::new);
+    v.map(|v| secret_to32(&v, idx)).transpose()
+}
+
+fn secret_to32(v: &[u8], idx: usize) -> rusqlite::Result<[u8; 32]> {
+    let mut out = [0u8; 32];
+    if v.len() != 32 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Blob,
+            format!("expected 32-byte key, got {} bytes", v.len()).into(),
+        ));
+    }
+    out.copy_from_slice(v);
+    Ok(out)
 }
 
 fn unix_now() -> i64 {

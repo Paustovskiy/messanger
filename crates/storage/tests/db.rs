@@ -896,7 +896,10 @@ fn secret_rows_zeroize_and_debug_has_no_secrets() {
         format!("{link:?}"),
         format!("{restore:?}"),
     ] {
-        assert!(!text.contains("[1,") && !text.contains("secret"), "{text}");
+        for n in [1u8, 3, 5, 6, 7, 8, 9, 10] {
+            let arr = format!("{:?}", [n; 32]);
+            assert!(!text.contains(&arr[..8]), "{text}");
+        }
     }
     id.zeroize_secrets();
     assert_eq!(id.secret, [0; 32]);
