@@ -8,7 +8,7 @@ use crypto_core::backup::{AccountBackup, BackupCode, open_account_backup, seal_a
 use fs4::fs_std::FileExt;
 use protocol::PRIMARY_DEVICE;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -159,6 +159,8 @@ fn ed25519_dalek_key(me: &crypto_core::Identity) -> Result<ed25519_dalek::Signin
 struct Staged {
     tmp: PathBuf,
     out: PathBuf,
+    /// Папка для fsync после публикации (только unix: на Windows папку так не открыть).
+    #[cfg(unix)]
     dir: PathBuf,
     done: bool,
     /// Пока `true`, обработчик SIGINT/SIGTERM удаляет временный файл. Кто первым
@@ -293,17 +295,23 @@ fn stage_verified(
     let mut staged = Staged {
         tmp,
         out: out.to_path_buf(),
+        #[cfg(unix)]
         dir,
         done: false,
         armed,
         lock: Some(file),
     };
+    // Читаем обратно через тот же хэндл: на Windows блокировка LockFileEx обязательная,
+    // и чтение через другой хэндл упало бы с ошибкой блокировки.
+    let mut written = Vec::new();
     if let Some(f) = staged.lock.as_mut() {
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
+        f.seek(SeekFrom::Start(0))?;
+        f.read_to_end(&mut written)
+            .context("не удалось перечитать записанный файл")?;
     }
 
-    let written = fs::read(&staged.tmp).context("не удалось перечитать записанный файл")?;
     let back = open_account_backup(&written, code.password())
         .map_err(|e| anyhow::anyhow!("проверка записанной копии не прошла: {e}"))?;
     if back.account_pub() != backup.account_pub()
@@ -483,13 +491,28 @@ async fn wait_for_signal(
             _ = term.recv() => 143,
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let ctrl_c = tokio::signal::ctrl_c();
-        tokio::pin!(ctrl_c);
+        // windows::ctrl_c() регистрирует обработчик сразу (tokio::signal::ctrl_c() — только
+        // при первом опросе): о готовности сообщаем, когда перехват уже стоит.
+        let mut ctrl_c = match tokio::signal::windows::ctrl_c() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = ready.send(Err(e.to_string()));
+                return None;
+            }
+        };
         let _ = ready.send(Ok(()));
-        let _ = ctrl_c.await;
+        // None — поток событий закрыт, это не Ctrl+C: файл не трогаем.
+        ctrl_c.recv().await?;
         Some(130)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Перехвата сигналов нет: временный файл после прерывания уберёт следующий запуск.
+        let _ = ready.send(Ok(()));
+        std::future::pending::<()>().await;
+        None
     }
 }
 
@@ -554,7 +577,8 @@ fn create_locked(path: &Path) -> Result<File> {
 
 fn create_private(path: &Path) -> Result<File> {
     let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
+    // read: файл перечитывается через этот же хэндл (см. stage_verified).
+    opts.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
