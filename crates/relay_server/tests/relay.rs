@@ -1196,11 +1196,13 @@ async fn bad_device_lists_and_unknown_devices_are_rejected() {
         ServerMessage::Error { message, .. } if message.contains("stale")
     ));
 
-    // Менять список может только основное устройство.
+    // Устройство без ключа аккаунта подписывает список своим ключом: релей
+    // сверяет подпись с закреплённым ключом аккаунта и отвергает.
     let mut p = Client::connect(&server.url(), &phone).await;
+    let own_key = Identity::generate(bob.account_id());
     assert!(matches!(
-        publish_list(&mut p, device_list(&bob, &[&phone], 4)).await,
-        ServerMessage::Error { message, .. } if message.contains("only the primary")
+        publish_list(&mut p, device_list(&own_key, &[&phone], 4)).await,
+        ServerMessage::Error { message, .. } if message.contains("bad device list")
     ));
 
     // Отправка на устройство, которого нет в списке.
@@ -1273,5 +1275,106 @@ async fn removed_device_is_disconnected_and_forgotten() {
         a.send_text(&phone, "m2", "x").await,
         ServerMessage::Error { message, .. } if message.contains("no such device")
     ));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn device_with_account_key_can_publish_device_list() {
+    let server = Server::start(Config::default()).await;
+    let bob = Identity::generate_new();
+    let phone = second_device(&bob, 2).with_account_key(bob.sign_secret_bytes());
+    let mut laptop = Client::connect(&server.url(), &bob).await;
+    publish_list(&mut laptop, device_list(&bob, &[&phone], 2)).await;
+    let mut p = Client::connect(&server.url(), &phone).await;
+
+    // Телефон с ключом аккаунта добавляет планшет: список v3 подписан им.
+    let tablet = second_device(&bob, 3);
+    let mut devices = vec![bob.device_info("ноутбук"), phone.device_info("телефон")];
+    devices.push(tablet.device_info("планшет"));
+    let list = protocol::DeviceList {
+        account_id: bob.account_id().into(),
+        account_pub: bob.sign_public_bytes(),
+        version: 3,
+        devices,
+    };
+    let wire = phone.sign_device_list(&list).unwrap();
+    assert!(matches!(
+        publish_list(&mut p, wire.clone()).await,
+        ServerMessage::DeviceList { list: Some(l), .. } if l == wire
+    ));
+    // Ноутбук получил список сразу.
+    assert_eq!(
+        laptop.recv().await,
+        ServerMessage::DeviceList {
+            account_id: bob.account_id().into(),
+            list: Some(wire)
+        }
+    );
+    // Планшет теперь может войти.
+    Client::connect(&server.url(), &tablet).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn list_changing_primary_entry_is_rejected() {
+    let server = Server::start(Config::default()).await;
+    let bob = Identity::generate_new();
+    let phone = second_device(&bob, 2).with_account_key(bob.sign_secret_bytes());
+    let mut laptop = Client::connect(&server.url(), &bob).await;
+    publish_list(&mut laptop, device_list(&bob, &[&phone], 2)).await;
+    let mut p = Client::connect(&server.url(), &phone).await;
+
+    let make = |primary: protocol::DeviceInfo| {
+        phone
+            .sign_device_list(&protocol::DeviceList {
+                account_id: bob.account_id().into(),
+                account_pub: bob.sign_public_bytes(),
+                version: 3,
+                devices: vec![primary, phone.device_info("телефон")],
+            })
+            .unwrap()
+    };
+    // Подмена x25519 у №1.
+    let mut swapped = bob.device_info("ноутбук");
+    swapped.x25519_pub = Identity::generate_new().x_public_bytes();
+    assert!(matches!(
+        publish_list(&mut p, make(swapped)).await,
+        ServerMessage::Error { message, .. } if message.contains("bad device list")
+    ));
+    // Смена имени у №1.
+    assert!(matches!(
+        publish_list(&mut p, make(bob.device_info("чужое имя"))).await,
+        ServerMessage::Error { message, .. } if message.contains("bad device list")
+    ));
+    // №1 не выкинут и в сети.
+    laptop.expect_silence().await;
+    let a = Identity::generate("alice");
+    let mut ac = Client::connect(&server.url(), &a).await;
+    accepted(&ac.send_text(&bob, "still", "жив").await, "still");
+    assert_eq!(laptop.recv_text(&a).await.1, "жив");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn republishing_same_list_has_no_side_effects() {
+    let server = Server::start(Config::default()).await;
+    let bob = Identity::generate_new();
+    let phone = second_device(&bob, 2);
+    let mut laptop = Client::connect(&server.url(), &bob).await;
+    let list = device_list(&bob, &[&phone], 2);
+    publish_list(&mut laptop, list.clone()).await;
+    let mut p = Client::connect(&server.url(), &phone).await;
+
+    assert!(matches!(
+        publish_list(&mut laptop, list).await,
+        ServerMessage::DeviceList { list: Some(_), .. }
+    ));
+    // Телефон не получил повторной рассылки и не отключён.
+    p.expect_silence().await;
+    laptop.expect_silence().await;
+    let a = Identity::generate("alice");
+    let mut ac = Client::connect(&server.url(), &a).await;
+    accepted(&ac.send_text(&phone, "m", "x").await, "m");
+    assert_eq!(p.recv_text(&a).await.1, "x");
     server.stop().await;
 }

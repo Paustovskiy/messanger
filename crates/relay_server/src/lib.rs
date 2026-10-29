@@ -526,7 +526,7 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
                 }
                 Ok(ClientMessage::PublishDeviceList { list }) => {
                     let reply = if relay.0.limiters.publishes.check(&me) {
-                        handle_publish_device_list(&relay, my, &my_sign_pub, list)
+                        handle_publish_device_list(&relay, my, list)
                     } else {
                         error(RATE_LIMITED, None)
                     };
@@ -588,7 +588,7 @@ fn authenticate(
             {
                 Ok(sign_pub)
             }
-            Ok(_) => Err("this device is not in the account's device list".into()),
+            Ok(_) => Err(protocol::ERR_NOT_IN_DEVICE_LIST.into()),
             Err(e) => {
                 warn!("store error during auth: {e:#}");
                 Err("internal error".into())
@@ -845,17 +845,18 @@ fn handle_fetch_bundle(relay: &Relay, me: &str, target: Device<'_>) -> String {
     }
 }
 
-fn handle_publish_device_list(
-    relay: &Relay,
-    me: Device<'_>,
-    my_sign_pub: &[u8; 32],
-    wire: SignedDeviceListB64,
-) -> String {
-    if me.1 != PRIMARY_DEVICE {
-        return error("only the primary device can change the device list", None);
-    }
-    // Ключ основного устройства и есть ключ аккаунта.
-    let list = match crypto_core::verify_device_list(&wire, me.0, Some(my_sign_pub)) {
+fn handle_publish_device_list(relay: &Relay, me: Device<'_>, wire: SignedDeviceListB64) -> String {
+    // Список подписан ключом аккаунта; публиковать может любое устройство
+    // аккаунта, у которого этот ключ есть.
+    let key = match relay.0.store.account_key(me.0) {
+        Ok(Some(k)) => k,
+        Ok(None) => return error("account has no bound key", None),
+        Err(e) => {
+            warn!("account key lookup failed: {e:#}");
+            return error("internal error", None);
+        }
+    };
+    let list = match crypto_core::verify_device_list(&wire, me.0, Some(&key)) {
         Ok(l) => l,
         Err(e) => return error(format!("bad device list: {e}"), None),
     };
@@ -868,8 +869,18 @@ fn handle_publish_device_list(
     };
     if let Some((old, old_wire)) = &old {
         if list.version < old.version || (list.version == old.version && *old_wire != wire) {
-            return error("stale device list version", None);
+            return error(protocol::ERR_STALE_DEVICE_LIST, None);
         }
+    }
+    if let Err(e) = protocol::backup::check_list_update(old.as_ref().map(|(l, _)| l), &list) {
+        return error(format!("bad device list: {e}"), None);
+    }
+    // Тот же список повторно: ничего не меняем и никого не трогаем.
+    if old.as_ref().is_some_and(|(_, w)| *w == wire) {
+        return to_json(&ServerMessage::DeviceList {
+            account_id: me.0.to_owned(),
+            list: Some(wire),
+        });
     }
     let json = serde_json::to_string(&wire).expect("serializable");
     if let Err(e) = relay.0.store.save_device_list(me.0, list.version, &json) {
