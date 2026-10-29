@@ -116,6 +116,14 @@ impl Client {
         c
     }
 
+    /// Подключиться и получить первое сообщение после входа (ожидается ошибка).
+    async fn connect_err(url: &str, id: &Identity) -> ServerMessage {
+        let mut c = Client::unauthenticated(url, id).await;
+        let nonce = c.challenge().await;
+        c.auth_with(&nonce, id).await;
+        c.recv().await
+    }
+
     async fn unauthenticated(url: &str, id: &Identity) -> Client {
         Client {
             ws: Self::raw(url).await,
@@ -1376,5 +1384,246 @@ async fn republishing_same_list_has_no_side_effects() {
     let mut ac = Client::connect(&server.url(), &a).await;
     accepted(&ac.send_text(&phone, "m", "x").await, "m");
     assert_eq!(p.recv_text(&a).await.1, "x");
+    server.stop().await;
+}
+
+// ---------- Сессия ключом аккаунта ----------
+
+/// Сессия аккаунта: тот же аккаунт и ключ, номер устройства 0.
+fn account_session(id: &Identity) -> Identity {
+    id.clone().with_device(protocol::ACCOUNT_SESSION_DEVICE)
+}
+
+async fn open_session(url: &str, id: &Identity) -> Client {
+    Client::connect(url, &account_session(id)).await
+}
+
+fn expect_error(m: ServerMessage, part: &str) {
+    match m {
+        ServerMessage::Error { message, .. } => {
+            assert!(message.contains(part), "unexpected error: {message}")
+        }
+        other => panic!("expected error {part:?}, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn account_session_needs_the_bound_account_key() {
+    let server = Server::start(Config::default()).await;
+    let bob = Identity::generate_new();
+
+    // Аккаунт релею ещё не известен: привязку сессия не создаёт.
+    expect_error(
+        Client::connect_err(&server.url(), &account_session(&bob)).await,
+        "needs a known account",
+    );
+    Client::connect(&server.url(), &bob).await;
+    open_session(&server.url(), &bob).await;
+
+    // Чужой ключ под номером аккаунта.
+    let other = Identity::generate_new();
+    let forged = Identity::from_secrets(
+        bob.account_id(),
+        other.x_secret_bytes(),
+        other.sign_secret_bytes(),
+    )
+    .with_device(0);
+    assert!(
+        auth_error(&server.url(), &forged)
+            .await
+            .contains("does not belong")
+    );
+    // Для аккаунта с произвольным ID чужой ключ — тоже отказ.
+    let alice = Identity::generate("alice-sess");
+    Client::connect(&server.url(), &alice).await;
+    let forged = Identity::generate("alice-sess").with_device(0);
+    assert!(
+        auth_error(&server.url(), &forged)
+            .await
+            .contains("different key")
+    );
+    // Ключ устройства №2 не годится.
+    let phone = second_device(&bob, 2);
+    let mut laptop = Client::connect(&server.url(), &bob).await;
+    publish_list(&mut laptop, device_list(&bob, &[&phone], 2)).await;
+    let phone_as_session = Identity::from_secrets(
+        bob.account_id(),
+        phone.x_secret_bytes(),
+        phone.sign_secret_bytes(),
+    )
+    .with_device(0);
+    assert!(
+        auth_error(&server.url(), &phone_as_session)
+            .await
+            .contains("does not belong")
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn account_session_works_for_non_key_derived_account() {
+    let server = Server::start(Config::default()).await;
+    let alice = Identity::generate("alice-legacy");
+    expect_error(
+        Client::connect_err(&server.url(), &account_session(&alice)).await,
+        "needs a known account",
+    );
+    Client::connect(&server.url(), &alice).await;
+    open_session(&server.url(), &alice).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn account_session_does_not_touch_queues() {
+    let server = Server::start(Config::default()).await;
+    let alice = Identity::generate("alice");
+    let bob = Identity::generate_new();
+    // Бобу пишут, пока он не в сети.
+    drop(Client::connect(&server.url(), &bob).await);
+    let mut a = Client::connect(&server.url(), &alice).await;
+    accepted(&a.send_text(&bob, "m1", "привет").await, "m1");
+    accepted(&a.send_text(&bob, "m2", "ещё").await, "m2");
+    drop(a);
+    // Боб подтверждает только первое; DeliverAck для Алисы остаётся в очереди.
+    let mut b = Client::connect(&server.url(), &bob).await;
+    assert_eq!(b.recv_text(&alice).await.1, "привет");
+    assert_eq!(b.recv_text(&alice).await.1, "ещё");
+    b.ack(&alice, "m1").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(b);
+
+    let mut s = open_session(&server.url(), &bob).await;
+    s.expect_silence().await;
+    drop(s);
+    let mut sa = open_session(&server.url(), &alice).await;
+    sa.expect_silence().await;
+    drop(sa);
+
+    // Ничего не потеряно и не отдано сессии.
+    let mut b = Client::connect(&server.url(), &bob).await;
+    assert_eq!(b.recv_text(&alice).await.1, "ещё");
+    let mut a = Client::connect(&server.url(), &alice).await;
+    assert!(matches!(a.recv().await, ServerMessage::DeliverAck { .. }));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn account_session_allows_only_device_list_requests() {
+    let server = Server::start(Config::default()).await;
+    let bob = Identity::generate_new();
+    Client::connect(&server.url(), &bob).await;
+    let mut s = open_session(&server.url(), &bob).await;
+    let alice = Identity::generate("alice");
+
+    let envelope = s.envelope(&alice, "x");
+    for m in [
+        ClientMessage::Send {
+            to: alice.account_id().into(),
+            to_device: 1,
+            msg_id: "x".into(),
+            envelope,
+        },
+        ClientMessage::Ack {
+            to: alice.account_id().into(),
+            to_device: 1,
+            msg_id: "x".into(),
+        },
+        publish(&bob, 1, 0..1),
+        ClientMessage::FetchBundle {
+            account_id: bob.account_id().into(),
+            device_id: 1,
+        },
+        ClientMessage::FetchDeviceList {
+            account_id: alice.account_id().into(),
+        },
+    ] {
+        s.send(m).await;
+        expect_error(s.recv_any().await, "not allowed in an account session");
+    }
+    // Свой список — можно.
+    s.send(ClientMessage::FetchDeviceList {
+        account_id: bob.account_id().into(),
+    })
+    .await;
+    assert!(matches!(
+        s.recv_any().await,
+        ServerMessage::DeviceList { list: None, .. }
+    ));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn account_session_publishes_device_list_and_notifies_devices() {
+    let server = Server::start(Config::default()).await;
+    let bob = Identity::generate_new();
+    let phone = second_device(&bob, 2);
+    let mut laptop = Client::connect(&server.url(), &bob).await;
+    let mut s = open_session(&server.url(), &bob).await;
+
+    let list = device_list(&bob, &[&phone], 2);
+    assert_eq!(
+        publish_list(&mut s, list.clone()).await,
+        ServerMessage::DeviceList {
+            account_id: bob.account_id().into(),
+            list: Some(list.clone())
+        }
+    );
+    assert_eq!(
+        laptop.recv().await,
+        ServerMessage::DeviceList {
+            account_id: bob.account_id().into(),
+            list: Some(list)
+        }
+    );
+    Client::connect(&server.url(), &phone).await;
+
+    // Откат версии из сессии отвергается, как и у обычного устройства.
+    expect_error(
+        publish_list(&mut s, device_list(&bob, &[], 1)).await,
+        "stale",
+    );
+    // Убираем телефон: он отключается, ноутбук получает список.
+    let mut p = Client::connect(&server.url(), &phone).await;
+    let list3 = device_list(&bob, &[], 3);
+    assert!(matches!(
+        publish_list(&mut s, list3.clone()).await,
+        ServerMessage::DeviceList { .. }
+    ));
+    assert!(matches!(
+        laptop.recv().await,
+        ServerMessage::DeviceList { list: Some(l), .. } if l == list3
+    ));
+    expect_error(p.recv().await, "removed");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn nothing_can_be_sent_to_the_account_session_device() {
+    let server = Server::start(Config::default()).await;
+    let alice = Identity::generate("alice");
+    let bob = Identity::generate_new();
+    Client::connect(&server.url(), &bob).await;
+    let mut a = Client::connect(&server.url(), &alice).await;
+    let _s = open_session(&server.url(), &bob).await;
+    let to = account_session(&bob);
+    expect_error(a.send_text(&to, "z", "в никуда").await, "no such device");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn account_sessions_are_capped_and_released() {
+    let server = Server::start(limited(|l| l.max_connections_per_account = 2)).await;
+    let bob = Identity::generate_new();
+    // Обычные соединения лимит сессий не занимают.
+    let _c = Client::connect(&server.url(), &bob).await;
+    let s1 = open_session(&server.url(), &bob).await;
+    let _s2 = open_session(&server.url(), &bob).await;
+    expect_error(
+        Client::connect_err(&server.url(), &account_session(&bob)).await,
+        "too many",
+    );
+    drop(s1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    open_session(&server.url(), &bob).await;
     server.stop().await;
 }
