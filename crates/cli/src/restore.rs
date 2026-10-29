@@ -25,8 +25,13 @@ use zeroize::Zeroizing;
 
 /// Почему восстановление остановилось и что делать с записью о нём.
 enum Fail {
-    /// Список не отправлялся или релей его явно отклонил: запись можно убрать.
+    /// Релей точно не хранит наших ключей (свежий список без них, явный отказ):
+    /// запись можно убрать всегда.
     Clear(anyhow::Error),
+    /// Список не отправлялся, но свежего списка без наших ключей мы не видели. При
+    /// первом запуске запись убираем; при повторе она остаётся: прошлый запуск мог
+    /// успеть опубликовать эти ключи.
+    Early(anyhow::Error),
     /// Список мог дойти до релея, ответа нет: запись остаётся для продолжения.
     Keep(anyhow::Error),
 }
@@ -133,6 +138,7 @@ pub fn cmd_restore_key(path: &Path, file: &Path, name: &str, relay: &str) -> Res
     };
     db.set_pending_restore(&pending)?;
 
+    let resumed = saved.is_some();
     let sent = Cell::new(false);
     let outcome = crate::runtime()?.block_on(async {
         tokio::select! {
@@ -140,16 +146,24 @@ pub fn cmd_restore_key(path: &Path, file: &Path, name: &str, relay: &str) -> Res
             _ = crate::shutdown_signal() => Err(if sent.get() {
                 Fail::Keep(anyhow!("прервано"))
             } else {
-                Fail::Clear(anyhow!("прервано"))
+                Fail::Early(anyhow!("прервано"))
             }),
         }
     });
     let done = match outcome {
         Ok(d) => d,
         Err(Fail::Clear(e)) => {
-            if let Err(ce) = db.clear_pending_restore() {
-                eprintln!("! не удалось убрать запись о восстановлении: {ce:#}");
+            clear_pending(&db);
+            return Err(e);
+        }
+        Err(Fail::Early(e)) => {
+            if resumed {
+                return Err(e.context(
+                    "запись о восстановлении сохранена: повторите `restore-key` с теми же \
+                     файлом и кодом",
+                ));
             }
+            clear_pending(&db);
             return Err(e);
         }
         Err(Fail::Keep(e)) => return Err(e),
@@ -201,19 +215,32 @@ pub fn cmd_restore_key(path: &Path, file: &Path, name: &str, relay: &str) -> Res
     Ok(())
 }
 
+fn clear_pending(db: &Db) {
+    if let Err(e) = db.clear_pending_restore() {
+        eprintln!("! не удалось убрать запись о восстановлении: {e:#}");
+    }
+}
+
 /// Выйти в сеть уже как новое устройство, чтобы опубликовать предключи.
 fn announce_device(db: &Db, relay: &str) -> Result<()> {
     let (_, me) = crate::load_identity(db)?;
     messaging::ensure_signed_prekey(db, &me)?;
+    // Устройство уже сохранено целиком, так что Ctrl+C здесь безопасен: предключи
+    // опубликует следующий `sync` или `listen`.
     crate::runtime()?.block_on(async {
-        let mut s = Session::open(relay, db, &me).await?;
-        crate::wait_for(&mut s, ACCEPT_TIMEOUT, |s| s.synced || s.removed).await?;
-        let synced = s.synced;
-        s.close().await;
-        if !synced {
-            bail!("релей не ответил");
+        tokio::select! {
+            r = async {
+                let mut s = Session::open(relay, db, &me).await?;
+                crate::wait_for(&mut s, ACCEPT_TIMEOUT, |s| s.synced || s.removed).await?;
+                let synced = s.synced;
+                s.close().await;
+                if !synced {
+                    bail!("релей не ответил");
+                }
+                Ok(())
+            } => r,
+            _ = crate::shutdown_signal() => bail!("прервано"),
         }
-        Ok(())
     })
 }
 
@@ -350,7 +377,7 @@ async fn publish_flow(
     let account_id = backup.account_id();
     let mut conn = RelayConn::connect_account(relay, account_id, backup.account_sign())
         .await
-        .map_err(Fail::Clear)?;
+        .map_err(Fail::Early)?;
     let keys = Identity::from_secrets(account_id, pending.x_secret, pending.sign_secret);
     let result = async {
         for _ in 0..LIST_ATTEMPTS {
@@ -358,12 +385,12 @@ async fn publish_flow(
                 account_id: account_id.to_owned(),
             })
             .await
-            .map_err(Fail::Clear)?;
+            .map_err(Fail::Early)?;
             let cur_wire = await_list(&mut conn, account_id)
                 .await
-                .map_err(Fail::Clear)?;
-            let cur = check_restore_list(cur_wire.as_ref(), backup).map_err(Fail::Clear)?;
-            let cur_wire = cur_wire.context("списка нет").map_err(Fail::Clear)?;
+                .map_err(Fail::Early)?;
+            let cur = check_restore_list(cur_wire.as_ref(), backup).map_err(Fail::Early)?;
+            let cur_wire = cur_wire.context("списка нет").map_err(Fail::Early)?;
 
             // Прошлый запуск успел опубликовать наши ключи — второй раз не добавляем.
             if let Some(d) = cur.devices.iter().find(|d| {

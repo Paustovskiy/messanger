@@ -1007,9 +1007,15 @@ fn handle_publish_device_list(relay: &Relay, me: Device<'_>, wire: SignedDeviceL
         });
     }
     let json = serde_json::to_string(&wire).expect("serializable");
-    if let Err(e) = relay.0.store.save_device_list(me.0, list.version, &json) {
-        warn!("save device list failed: {e:#}");
-        return error("internal error", None);
+    match relay.0.store.save_device_list(me.0, list.version, &json) {
+        Ok(true) => {}
+        // Другой держатель ключа успел записать список этой версии между проверкой и
+        // записью: наш не сохранён, ни выгонять, ни рассылать по нему нельзя.
+        Ok(false) => return error(protocol::ERR_STALE_DEVICE_LIST, None),
+        Err(e) => {
+            warn!("save device list failed: {e:#}");
+            return error("internal error", None);
+        }
     }
 
     // Убранные устройства (или чей номер теперь с другими ключами): забыть их

@@ -1290,9 +1290,13 @@ fn change_own_list(
 ) -> Result<(DeviceList, SignedDeviceListB64)> {
     let offline = "список устройств не изменён";
     runtime()?.block_on(async {
-        let mut s = Session::open(relay, db, me)
-            .await
-            .with_context(|| format!("релей недоступен, {offline}"))?;
+        let mut s = match Session::open(relay, db, me).await {
+            Ok(s) => s,
+            Err(e) if format!("{e:#}").contains(protocol::ERR_NOT_IN_DEVICE_LIST) => {
+                bail!("это устройство отключено от аккаунта")
+            }
+            Err(e) => return Err(e.context(format!("релей недоступен, {offline}"))),
+        };
         wait_for(&mut s, ACCEPT_TIMEOUT, |s| s.synced || s.removed).await?;
         if s.removed {
             bail!("это устройство отключено от аккаунта");
@@ -1332,6 +1336,10 @@ fn change_own_list(
                         "список устройств на релее изменился во время публикации, \
                          повторите команду"
                     ));
+                }
+                Err(e) if format!("{e:#}").contains(session::PUBLISH_UNKNOWN) => {
+                    result = Err(e);
+                    break;
                 }
                 Err(e) => {
                     result = Err(e.context(format!("релей не принял список, {offline}")));

@@ -458,3 +458,22 @@ fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_list_of_the_same_or_older_version_is_not_saved() {
+        let store = Store::open(None).unwrap();
+        assert!(store.save_device_list("acc", 2, "first").unwrap());
+        // Проигравший гонку: та же версия с другим содержимым и более старая.
+        assert!(!store.save_device_list("acc", 2, "other").unwrap());
+        assert!(!store.save_device_list("acc", 1, "older").unwrap());
+        assert_eq!(
+            store.device_list("acc").unwrap(),
+            Some((2, "first".to_owned()))
+        );
+        assert!(store.save_device_list("acc", 3, "newer").unwrap());
+    }
+}

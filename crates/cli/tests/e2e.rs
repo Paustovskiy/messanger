@@ -1558,3 +1558,56 @@ fn restore_key_resumes_after_a_failure() {
     assert!(db.pending_restore().unwrap().is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Повтор при недоступном релее не стирает запись: ключи уже могли быть опубликованы.
+#[test]
+fn restore_key_retry_keeps_the_record_when_the_relay_is_down() {
+    let dir = tmp_dir("restore-down");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    bob.ok(&["sync"]);
+    let file = dir.join("key.backup");
+    let code = make_backup(&bob, &file);
+    let secret = open_backup(&file, &code).unwrap().account_sign().to_bytes();
+    let account_id = field(&bob.ok(&["whoami"]), "account_id:");
+
+    let first = User::new(&dir, "first", &relay);
+    let n = device_number(&restore_ok(&first, &file, &code, "первое"));
+    let (x, sign) = {
+        let db = storage::Db::open(&first.db, Some(TEST_PASSWORD)).unwrap();
+        let row = db.get_local_identity().unwrap().unwrap();
+        (row.secret, row.sign_secret.unwrap())
+    };
+    let pending = storage::PendingRestore {
+        account_id,
+        account_secret: secret,
+        x_secret: x,
+        sign_secret: sign,
+        name: "прежнее".into(),
+    };
+    let db_path = dir.join("retry.sqlite");
+    {
+        let db = storage::Db::open(&db_path, Some(TEST_PASSWORD)).unwrap();
+        db.set_pending_restore(&pending).unwrap();
+    }
+
+    let down = User::new(&dir, "retry", "ws://127.0.0.1:1");
+    let out = restore(&down, &file, &code, &["--name", "повтор"]);
+    assert!(!out.status.success());
+    {
+        let db = storage::Db::open(&db_path, Some(TEST_PASSWORD)).unwrap();
+        assert!(db.pending_restore().unwrap().is_some());
+        assert!(db.get_local_identity().unwrap().is_none());
+    }
+
+    let up = User::new(&dir, "retry", &relay);
+    let again = restore_ok(&up, &file, &code, "повтор");
+    assert_eq!(device_number(&again), n, "{again}");
+    listen_stderr_until(&bob, "изменён на другом устройстве");
+    let list = bob.ok(&["devices"]);
+    assert_eq!(list.matches("№").count(), 2, "{list}");
+    let db = storage::Db::open(&db_path, Some(TEST_PASSWORD)).unwrap();
+    assert!(db.pending_restore().unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}

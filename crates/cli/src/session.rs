@@ -23,6 +23,10 @@ use storage::{Db, Direction, OutboxItem};
 /// Сколько ждать ответа релея на публикацию списка устройств.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Текст ошибки, когда ответ на публикацию списка не пришёл: релей мог его принять.
+pub const PUBLISH_UNKNOWN: &str =
+    "неизвестно, принял ли релей список; проверьте `messenger devices` после sync";
+
 pub enum Step {
     Handled,
     Timeout,
@@ -155,12 +159,12 @@ impl<'a> Session<'a> {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                bail!("релей не ответил на публикацию списка устройств");
+                bail!("{PUBLISH_UNKNOWN}");
             }
             match self.step(Some(left)).await? {
                 Step::Handled => {}
-                Step::Timeout => bail!("релей не ответил на публикацию списка устройств"),
-                Step::Closed => bail!("релей закрыл соединение"),
+                Step::Timeout => bail!("{PUBLISH_UNKNOWN}"),
+                Step::Closed => bail!("релей закрыл соединение; {PUBLISH_UNKNOWN}"),
             }
         }
     }
@@ -336,6 +340,10 @@ impl<'a> Session<'a> {
                 self.publish_device_list(wire).await?;
             }
             (_, Some(v)) if Some(v) > local => self.fetch_device_list(&me).await?,
+            // Та же версия: у держателя ключа сверяем содержимое (см. `on_device_list`).
+            (_, Some(v)) if Some(v) == local && self.me.has_account_key() => {
+                self.fetch_device_list(&me).await?;
+            }
             _ => {}
         }
         Ok(())
@@ -367,6 +375,17 @@ impl<'a> Session<'a> {
                 if !still_here {
                     self.removed = true;
                     eprintln!("! это устройство отключено от аккаунта");
+                }
+            }
+            Ok(None) if account == self.me.account_id() && self.me.has_account_key() => {
+                if let Ok(Some((l, mine))) = devices::stored(self.db, &account) {
+                    if l.version == wire.version && mine != *wire {
+                        eprintln!(
+                            "! на релее список устройств той же версии v{}, но с другим \
+                             содержимым: проверьте `messenger devices`",
+                            l.version
+                        );
+                    }
                 }
             }
             Ok(_) => {}
