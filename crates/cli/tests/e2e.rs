@@ -580,7 +580,7 @@ fn second_device_joins_receives_and_is_unlinked() {
     }
 
     // Телефон потерян: Боб отключает его.
-    let out = bob.ok(&["unlink", "2"]);
+    let out = bob.ok(&["unlink", "2", "--yes"]);
     assert!(out.contains("отключено"), "{out}");
     assert!(!bob.ok(&["devices"]).contains("телефон"));
     let out = phone.run(&["sync"]);
@@ -636,10 +636,85 @@ fn unlinked_device_number_is_not_reused() {
             .collect()
     };
     let n1 = number(&first);
-    bob.ok(&["unlink", &n1]);
+    bob.ok(&["unlink", &n1, "--yes"]);
     let second = link("phone-b");
     let n2 = number(&second);
     assert_ne!(n1, n2, "номер отключённого устройства выдан повторно");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Подключает новое устройство и возвращает его код и профиль.
+fn pending_phone(dir: &Path, relay: &str, name: &str) -> (User, String) {
+    let phone = User::new(dir, name, relay);
+    let out = phone.run(&["link", "--name", name]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (phone, code)
+}
+
+/// Менять список устройств можно только через релей, а отключать — осознанно:
+/// без релея, без подтверждения и самого себя нельзя; локальный список при этом
+/// не меняется.
+#[test]
+fn list_changes_need_relay_and_confirmation() {
+    let dir = tmp_dir("devices-guards");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    bob.ok(&["set-username", "bobby"]);
+    let (phone, code) = pending_phone(&dir, &relay, "phone");
+    let response = dir.join("r.json");
+    bob.ok(&[
+        "link-approve",
+        &code,
+        "--yes",
+        "-o",
+        response.to_str().unwrap(),
+    ]);
+    phone.ok(&["link-finish", "--response-file", response.to_str().unwrap()]);
+    let before = bob.ok(&["devices"]);
+    assert!(before.contains("phone"), "{before}");
+
+    // Нельзя отключить само это устройство; №1 — тоже.
+    let out = bob.run(&["unlink", "1", "--yes"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("нельзя отключить это устройство"),
+        "{}",
+        stderr(&out)
+    );
+
+    // Без --yes и без терминала — отказ, список прежний.
+    let out = bob.run(&["unlink", "2"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--yes"), "{}", stderr(&out));
+    assert_eq!(bob.ok(&["devices"]), before);
+
+    // Релей недоступен: понятная ошибка, список прежний.
+    let offline = User {
+        db: bob.db.clone(),
+        relay: "ws://127.0.0.1:1/ws".into(),
+    };
+    let out = offline.run(&["unlink", "2", "--yes"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("релей недоступен"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(bob.ok(&["devices"]), before);
+
+    let (phone2, code2) = pending_phone(&dir, &relay, "phone2");
+    let _ = phone2;
+    let out = offline.run(&["link-approve", &code2, "--yes"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("релей недоступен"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(bob.ok(&["devices"]), before);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

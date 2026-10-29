@@ -84,15 +84,6 @@ pub fn own_list(db: &Db, me: &Identity) -> Result<(DeviceList, SignedDeviceListB
     Ok((list, wire))
 }
 
-/// Подписать и сохранить новую версию своего списка (только основное устройство).
-pub fn save_own(db: &Db, me: &Identity, list: &DeviceList) -> Result<SignedDeviceListB64> {
-    let wire = me
-        .sign_device_list(list)
-        .context("менять список устройств может только устройство с ключом аккаунта")?;
-    accept(db, me, &wire)?;
-    Ok(wire)
-}
-
 /// Ключ аккаунта, которым должен быть подписан его список устройств.
 fn account_key(db: &Db, me: &Identity, account_id: &str) -> Result<Option<[u8; 32]>> {
     if account_id == me.account_id() {
