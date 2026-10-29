@@ -19,3 +19,8 @@
   restore default signal handling). If `publish`, fsync or the read-back hangs
   (e.g. on NFS), Ctrl+C does nothing and only `kill -9` helps. At least document
   it in the code; ideally restore default handling or use a timeout.
+- [ ] **`same_file` on Windows compares only the size.** The non-unix
+  `same_file` (`crates/cli/src/backup.rs`) checks `is_file()` and `len()`, so
+  `create_locked` and `remove_stale_tmp` cannot tell two different files of the
+  same size apart (the unix version compares dev/ino). Compare the volume serial
+  number and file index (`GetFileInformationByHandle`) instead.
