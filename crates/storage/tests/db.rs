@@ -17,6 +17,7 @@ fn identity_row(id: &Identity) -> IdentityRow {
         public: id.x_public_bytes(),
         sign_secret: Some(id.sign_secret_bytes()),
         sign_public: Some(id.sign_public_bytes()),
+        account_sign_secret: id.account_sign_secret_bytes(),
     }
 }
 
@@ -55,7 +56,7 @@ fn fresh_database_stores_and_loads_identity() {
     }
     let db = Db::open(&path, None).unwrap();
     let row = db.get_local_identity().unwrap().unwrap();
-    assert_eq!(row, identity_row(&me));
+    assert_same_identity(&row, &identity_row(&me));
 
     db.set_username("acc-1", Some("@alice")).unwrap();
     assert_eq!(
@@ -584,7 +585,10 @@ fn pending_link_roundtrip() {
     };
     db.set_pending_link(&link).unwrap();
     db.set_pending_link(&link).unwrap();
-    assert_eq!(db.pending_link().unwrap(), Some(link));
+    let got = db.pending_link().unwrap().unwrap();
+    assert_eq!(got.x_secret, link.x_secret);
+    assert_eq!(got.sign_secret, link.sign_secret);
+    assert_eq!(got.name, link.name);
     db.clear_pending_link().unwrap();
     assert!(db.pending_link().unwrap().is_none());
 }
@@ -695,4 +699,168 @@ fn concurrent_writers_do_not_lose_updates() {
             .as_deref(),
         Some("100")
     );
+}
+
+/// База v5: колонки ключа аккаунта и таблицы pending_restore нет. Миграция только
+/// добавляет; у старой личности ключа аккаунта нет.
+#[test]
+fn migrates_v5_to_v6_adding_account_key_column() {
+    let path = tmp_path("legacy-v5");
+    let me = Identity::generate_new();
+    {
+        let db = Db::open(&path, None).unwrap();
+        db.upsert_identity(&identity_row(&me)).unwrap();
+        db.save_sessions("bob", 1, "state").unwrap();
+        db.set_pending_link(&PendingLink {
+            x_secret: [1; 32],
+            sign_secret: [2; 32],
+            name: "phone".into(),
+        })
+        .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE identities DROP COLUMN account_sign_secret;
+             DROP TABLE pending_restore;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    }
+    let db = Db::open(&path, None).unwrap();
+    let row = db.get_local_identity().unwrap().unwrap();
+    assert_eq!(row.account_id, me.account_id());
+    assert_eq!(row.sign_secret, Some(me.sign_secret_bytes()));
+    assert_eq!(row.account_sign_secret, None);
+    // Всё прежнее на месте.
+    assert_eq!(
+        db.load_sessions("bob", 1).unwrap().as_deref(),
+        Some("state")
+    );
+    assert!(db.pending_link().unwrap().is_some());
+    assert!(db.pending_restore().unwrap().is_none());
+    drop(db);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 6);
+    // Повторное открытие ничего не ломает.
+    drop(conn);
+    assert!(
+        Db::open(&path, None)
+            .unwrap()
+            .get_local_identity()
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn fresh_v6_has_account_key_column_and_roundtrips() {
+    let db = Db::open_in_memory().unwrap();
+    assert_eq!(SCHEMA_VERSION, 6);
+    let primary = Identity::generate_new();
+    let device = Identity::generate(primary.account_id())
+        .with_device(3)
+        .with_account_key(primary.sign_secret_bytes());
+    let mut row = identity_row(&device);
+    assert_eq!(row.account_sign_secret, Some(primary.sign_secret_bytes()));
+    db.upsert_identity(&row).unwrap();
+    assert_same_identity(&db.get_local_identity().unwrap().unwrap(), &row);
+    // Обновление поля.
+    row.account_sign_secret = None;
+    db.upsert_identity(&row).unwrap();
+    assert_eq!(
+        db.get_local_identity()
+            .unwrap()
+            .unwrap()
+            .account_sign_secret,
+        None
+    );
+}
+
+#[test]
+fn pending_restore_roundtrip() {
+    let db = Db::open_in_memory().unwrap();
+    assert!(db.pending_restore().unwrap().is_none());
+    let p = PendingRestore {
+        account_id: "acc".into(),
+        account_secret: [1; 32],
+        x_secret: [2; 32],
+        sign_secret: [3; 32],
+        name: "новый".into(),
+    };
+    db.set_pending_restore(&p).unwrap();
+    assert_same_restore(&db.pending_restore().unwrap().unwrap(), &p);
+    let q = PendingRestore {
+        name: "другой".into(),
+        account_secret: [9; 32],
+        ..p
+    };
+    db.set_pending_restore(&q).unwrap();
+    assert_same_restore(&db.pending_restore().unwrap().unwrap(), &q);
+    db.clear_pending_restore().unwrap();
+    assert!(db.pending_restore().unwrap().is_none());
+}
+
+#[test]
+fn debug_output_has_no_secrets() {
+    let id = Identity::generate_new();
+    let device = Identity::generate(id.account_id())
+        .with_device(2)
+        .with_account_key([0x5a; 32]);
+    let row = identity_row(&device);
+    let link = PendingLink {
+        x_secret: [0x71; 32],
+        sign_secret: [0x72; 32],
+        name: "phone".into(),
+    };
+    let restore = PendingRestore {
+        account_id: "acc".into(),
+        account_secret: [0x73; 32],
+        x_secret: [0x74; 32],
+        sign_secret: [0x75; 32],
+        name: "n".into(),
+    };
+    for dbg in [
+        format!("{row:?}"),
+        format!("{link:?}"),
+        format!("{restore:?}"),
+    ] {
+        for b in [
+            0x5a,
+            0x71,
+            0x72,
+            0x73,
+            0x74,
+            0x75,
+            row.secret[0],
+            row.sign_secret.unwrap()[0],
+        ] {
+            // Байты секретов в десятичном виде, как печатает derive(Debug) массивов.
+            assert!(!dbg.contains(&format!("[{b}, ")), "{dbg}");
+        }
+        assert!(!dbg.contains("secret:"), "{dbg}");
+    }
+    assert!(format!("{row:?}").contains("has_account_key: true"));
+}
+
+fn assert_same_identity(a: &storage::IdentityRow, b: &storage::IdentityRow) {
+    assert_eq!(a.account_id, b.account_id);
+    assert_eq!(a.device_id, b.device_id);
+    assert_eq!(a.username, b.username);
+    assert_eq!(a.secret, b.secret);
+    assert_eq!(a.public, b.public);
+    assert_eq!(a.sign_secret, b.sign_secret);
+    assert_eq!(a.sign_public, b.sign_public);
+    assert_eq!(a.account_sign_secret, b.account_sign_secret);
+}
+
+fn assert_same_restore(a: &PendingRestore, b: &PendingRestore) {
+    assert_eq!(a.account_id, b.account_id);
+    assert_eq!(a.account_secret, b.account_secret);
+    assert_eq!(a.x_secret, b.x_secret);
+    assert_eq!(a.sign_secret, b.sign_secret);
+    assert_eq!(a.name, b.name);
 }

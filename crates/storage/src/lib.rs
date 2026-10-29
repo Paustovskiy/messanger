@@ -31,7 +31,7 @@ pub mod encryption;
 pub use encryption::{FileState, PasswordRequired, WrongPassword, file_state, reencrypt};
 
 /// Текущая версия схемы.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub struct Db {
     conn: Connection,
@@ -39,7 +39,7 @@ pub struct Db {
     _lock: Option<fs::File>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct IdentityRow {
     pub account_id: String,
     /// Номер этого устройства в аккаунте (1 — основное).
@@ -53,6 +53,21 @@ pub struct IdentityRow {
     pub sign_secret: Option<[u8; 32]>,
     /// Ed25519 verifying key.
     pub sign_public: Option<[u8; 32]>,
+    /// Секрет ключа аккаунта на устройстве не №1 (восстановление из резервной
+    /// копии). У №1 — `None`: там ключ аккаунта это `sign_secret`.
+    pub account_sign_secret: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for IdentityRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Секреты в Debug не попадают.
+        f.debug_struct("IdentityRow")
+            .field("account_id", &self.account_id)
+            .field("device_id", &self.device_id)
+            .field("username", &self.username)
+            .field("has_account_key", &self.account_sign_secret.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,11 +204,41 @@ pub struct Acked {
 }
 
 /// Ключи устройства, которое ещё только подключается к аккаунту.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct PendingLink {
     pub x_secret: [u8; 32],
     pub sign_secret: [u8; 32],
     pub name: String,
+}
+
+impl std::fmt::Debug for PendingLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLink")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Устройство, которое восстанавливает ключ аккаунта из резервной копии: ключи уже
+/// выбраны и записаны, но список устройств ещё не опубликован.
+#[derive(Clone)]
+pub struct PendingRestore {
+    pub account_id: String,
+    /// Ключ аккаунта из копии (seed Ed25519).
+    pub account_secret: [u8; 32],
+    /// Ключи нового устройства.
+    pub x_secret: [u8; 32],
+    pub sign_secret: [u8; 32],
+    pub name: String,
+}
+
+impl std::fmt::Debug for PendingRestore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRestore")
+            .field("account_id", &self.account_id)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Новое сообщение для [`Db::insert_message`].
@@ -291,7 +336,8 @@ impl Db {
     pub fn get_local_identity(&self) -> Result<Option<IdentityRow>> {
         self.conn
             .query_row(
-                "SELECT account_id, username, secret, public, sign_secret, sign_public, device_id
+                "SELECT account_id, username, secret, public, sign_secret, sign_public, device_id,
+                        account_sign_secret
                  FROM identities ORDER BY created_at ASC, rowid ASC LIMIT 1",
                 [],
                 |r| {
@@ -303,6 +349,7 @@ impl Db {
                         sign_secret: blob32_opt(r, 4)?,
                         sign_public: blob32_opt(r, 5)?,
                         device_id: r.get(6)?,
+                        account_sign_secret: blob32_opt(r, 7)?,
                     })
                 },
             )
@@ -313,15 +360,16 @@ impl Db {
     /// Создать или обновить личность по `account_id`.
     pub fn upsert_identity(&self, row: &IdentityRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO identities (account_id, username, secret, public, sign_secret, sign_public, created_at, device_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO identities (account_id, username, secret, public, sign_secret, sign_public, created_at, device_id, account_sign_secret)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(account_id) DO UPDATE SET
                  username    = excluded.username,
                  secret      = excluded.secret,
                  public      = excluded.public,
                  sign_secret = excluded.sign_secret,
                  sign_public = excluded.sign_public,
-                 device_id   = excluded.device_id",
+                 device_id   = excluded.device_id,
+                 account_sign_secret = excluded.account_sign_secret",
             params![
                 row.account_id,
                 row.username,
@@ -331,6 +379,7 @@ impl Db {
                 row.sign_public.as_ref().map(|k| &k[..]),
                 unix_now(),
                 row.device_id,
+                row.account_sign_secret.as_ref().map(|k| &k[..]),
             ],
         )?;
         Ok(())
@@ -485,6 +534,55 @@ impl Db {
 
     pub fn clear_pending_link(&self) -> Result<()> {
         self.conn.execute("DELETE FROM pending_link", [])?;
+        Ok(())
+    }
+
+    // ----- восстановление ключа аккаунта ----------------------------------
+
+    pub fn pending_restore(&self) -> Result<Option<PendingRestore>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT account_id, account_secret, x_secret, sign_secret, name
+                 FROM pending_restore WHERE id = 1",
+                [],
+                |r| {
+                    Ok(PendingRestore {
+                        account_id: r.get(0)?,
+                        account_secret: blob32(r, 1)?,
+                        x_secret: blob32(r, 2)?,
+                        sign_secret: blob32(r, 3)?,
+                        name: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn set_pending_restore(&self, p: &PendingRestore) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending_restore
+                 (id, account_id, account_secret, x_secret, sign_secret, name, created_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                 account_id = excluded.account_id,
+                 account_secret = excluded.account_secret,
+                 x_secret = excluded.x_secret, sign_secret = excluded.sign_secret,
+                 name = excluded.name, created_at = excluded.created_at",
+            params![
+                p.account_id,
+                &p.account_secret[..],
+                &p.x_secret[..],
+                &p.sign_secret[..],
+                p.name,
+                unix_now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_pending_restore(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM pending_restore", [])?;
         Ok(())
     }
 
@@ -1113,6 +1211,20 @@ const SCHEMA_V5: &str = "
     );
 ";
 
+/// v6: восстановление ключа аккаунта из резервной копии. Колонка
+/// `identities.account_sign_secret` добавляется ниже вместе с остальными.
+const SCHEMA_V6: &str = "
+    CREATE TABLE IF NOT EXISTS pending_restore (
+        id             INTEGER PRIMARY KEY CHECK (id = 1),
+        account_id     TEXT NOT NULL,
+        account_secret BLOB NOT NULL,
+        x_secret       BLOB NOT NULL,
+        sign_secret    BLOB NOT NULL,
+        name           TEXT NOT NULL,
+        created_at     INTEGER NOT NULL
+    );
+";
+
 /// Сессии и метки X3DH v5: ключ — (собеседник, его устройство).
 const SESSIONS_V5: &str = "
     CREATE TABLE sessions (
@@ -1184,6 +1296,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
     tx.execute_batch(SCHEMA_V4)?;
     tx.execute_batch(SCHEMA_V5)?;
+    tx.execute_batch(SCHEMA_V6)?;
 
     // Колонки, которые появлялись по ходу развития.
     for (table, column, ddl) in [
@@ -1241,6 +1354,11 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             "identities",
             "device_id",
             "ALTER TABLE identities ADD COLUMN device_id INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "identities",
+            "account_sign_secret",
+            "ALTER TABLE identities ADD COLUMN account_sign_secret BLOB NULL",
         ),
     ] {
         if !column_exists(&tx, table, column)? {

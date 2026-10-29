@@ -25,6 +25,8 @@ futures-util.workspace = true
 rustls.workspace = true
 rpassword.workspace = true
 zeroize.workspace = true
+ed25519-dalek.workspace = true
+fs4.workspace = true
 
 [dev-dependencies]
 relay_server.workspace = true

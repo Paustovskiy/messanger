@@ -9,6 +9,7 @@
 //! [`ratchet`]). Поверх этого каждый конверт подписан отправителем, чтобы релей
 //! мог отсеивать подделки, не умея ничего расшифровать.
 
+pub mod backup;
 pub mod ratchet;
 pub mod session;
 
@@ -63,7 +64,8 @@ pub enum CryptoError {
 ///
 /// На основном устройстве (№1) ключ подписи — это ключ аккаунта: им же
 /// подписываются карточка контакта и список устройств. На остальных устройствах
-/// ключ подписи свой, а ключа аккаунта нет вовсе.
+/// ключ подписи свой, а ключа аккаунта нет — кроме устройства, восстановленного из
+/// резервной копии: оно хранит ключ аккаунта отдельно (`account_sign`).
 #[derive(Clone)]
 pub struct Identity {
     account_id: String,
@@ -71,6 +73,9 @@ pub struct Identity {
     x_secret: StaticSecret,
     x_public: PublicKey,
     sign: SigningKey,
+    /// Ключ аккаунта на устройстве, которое не №1 (восстановление из копии).
+    /// Для №1 всегда `None`: там ключом аккаунта служит `sign`.
+    account_sign: Option<SigningKey>,
 }
 
 impl std::fmt::Debug for Identity {
@@ -123,7 +128,48 @@ impl Identity {
             x_secret,
             x_public,
             sign,
+            account_sign: None,
         }
+    }
+
+    /// Выдать устройству ключ аккаунта (seed Ed25519). У №1 ключ аккаунта уже есть
+    /// (`sign`), поэтому там вызов ничего не меняет.
+    pub fn with_account_key(mut self, secret: [u8; 32]) -> Self {
+        if self.device_id != protocol::PRIMARY_DEVICE {
+            self.account_sign = Some(SigningKey::from_bytes(&secret));
+        }
+        self
+    }
+
+    /// Есть ли у устройства ключ аккаунта: оно №1 или получило ключ из копии.
+    pub fn has_account_key(&self) -> bool {
+        self.device_id == protocol::PRIMARY_DEVICE || self.account_sign.is_some()
+    }
+
+    /// Ключ аккаунта, если он у устройства есть.
+    fn account_key(&self) -> Option<&SigningKey> {
+        if self.device_id == protocol::PRIMARY_DEVICE {
+            Some(&self.sign)
+        } else {
+            self.account_sign.as_ref()
+        }
+    }
+
+    /// Публичный ключ аккаунта, если устройство им владеет.
+    pub fn account_public_bytes(&self) -> Option<[u8; 32]> {
+        self.account_key().map(|k| k.verifying_key().to_bytes())
+    }
+
+    /// Секрет ключа аккаунта, **отдельный** от ключа подписи устройства: только у
+    /// устройства не №1 с ключом из копии (у №1 он и так хранится как `sign`).
+    pub fn account_sign_secret_bytes(&self) -> Option<[u8; 32]> {
+        self.account_sign.as_ref().map(SigningKey::to_bytes)
+    }
+
+    /// Подписать данные ключом аккаунта.
+    pub fn sign_as_account(&self, data: &[u8]) -> Result<[u8; 64], CryptoError> {
+        let key = self.account_key().ok_or(CryptoError::NotAccountKey)?;
+        Ok(key.sign(data).to_bytes())
     }
 
     /// То же устройство, но с другим номером (для дополнительных устройств).
@@ -150,16 +196,19 @@ impl Identity {
         }
     }
 
-    /// Подписать список устройств. Может только основное устройство: его ключ
-    /// подписи и есть ключ аккаунта.
+    /// Подписать список устройств ключом аккаунта. Могут только основное устройство
+    /// и устройство, которому выдан ключ аккаунта (`with_account_key`).
     pub fn sign_device_list(&self, list: &DeviceList) -> Result<SignedDeviceListB64, CryptoError> {
-        if list.account_id != self.account_id || list.account_pub != self.sign_public_bytes() {
+        let account_pub = self
+            .account_public_bytes()
+            .ok_or(CryptoError::NotAccountKey)?;
+        if list.account_id != self.account_id || list.account_pub != account_pub {
             return Err(CryptoError::NotAccountKey);
         }
         list.validate()?;
         Ok(SignedDeviceListB64::from_parts(
             list,
-            self.sign(&list.signing_bytes()),
+            self.sign_as_account(&list.signing_bytes())?,
         ))
     }
 
@@ -199,6 +248,35 @@ impl Identity {
         };
         let sig = self.sign(&payload.signing_bytes());
         ContactCardV2::from_parts(&payload, sig)
+    }
+
+    /// Карточка контакта от устройства, которое не №1, но владеет ключом аккаунта.
+    ///
+    /// Карточка описывает основное устройство, поэтому его X25519 (`primary_x25519_pub`)
+    /// берётся из списка устройств, а не из собственного ключа. Подписанного предключа
+    /// в карточке нет: он принадлежит устройству №1, а не этому. Для самого №1
+    /// результат совпадает с [`Identity::contact_card`].
+    pub fn account_contact_card(
+        &self,
+        username: Option<String>,
+        primary_x25519_pub: [u8; 32],
+    ) -> Result<ContactCardV2, CryptoError> {
+        let account_pub = self
+            .account_public_bytes()
+            .ok_or(CryptoError::NotAccountKey)?;
+        let x25519_pub = if self.device_id == protocol::PRIMARY_DEVICE {
+            self.x_public_bytes()
+        } else {
+            primary_x25519_pub
+        };
+        let payload = ContactCardPayload {
+            account_id: self.account_id.clone(),
+            username,
+            x25519_pub,
+            ed25519_pub: account_pub,
+        };
+        let sig = self.sign_as_account(&payload.signing_bytes())?;
+        Ok(ContactCardV2::from_parts(&payload, sig))
     }
 }
 

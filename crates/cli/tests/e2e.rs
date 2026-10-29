@@ -599,3 +599,451 @@ fn second_device_joins_receives_and_is_unlinked() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Номер отключённого устройства не выдаётся заново, даже если оно было с
+/// наибольшим номером.
+#[test]
+fn unlinked_device_number_is_not_reused() {
+    let dir = tmp_dir("devices-reuse");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    bob.ok(&["set-username", "bobby"]);
+
+    let link = |name: &str| -> String {
+        let phone = User::new(&dir, name, &relay);
+        let out = phone.run(&["link", "--name", name]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let response = dir.join(format!("{name}.json"));
+        bob.ok(&[
+            "link-approve",
+            &code,
+            "--yes",
+            "-o",
+            response.to_str().unwrap(),
+        ]);
+        phone.ok(&["link-finish", "--response-file", response.to_str().unwrap()])
+    };
+
+    let first = link("phone-a");
+    let number = |text: &str| -> String {
+        let at = text.find("устройство №").expect("номер в выводе");
+        text[at..]
+            .chars()
+            .skip("устройство №".chars().count())
+            .take_while(char::is_ascii_digit)
+            .collect()
+    };
+    let n1 = number(&first);
+    bob.ok(&["unlink", &n1]);
+    let second = link("phone-b");
+    let n2 = number(&second);
+    assert_ne!(n1, n2, "номер отключённого устройства выдан повторно");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Код восстановления из вывода `backup-key`: единственная строка с отступом из 4 пробелов.
+fn backup_code(output: &str) -> String {
+    output
+        .lines()
+        .find(|l| l.starts_with("    ") && l.trim().len() > 20)
+        .unwrap_or_else(|| panic!("нет кода в выводе:\n{output}"))
+        .trim()
+        .to_string()
+}
+
+fn open_backup(path: &Path, code: &str) -> Result<crypto_core::backup::AccountBackup, String> {
+    let code = crypto_core::backup::BackupCode::parse(code).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    crypto_core::backup::open_account_backup(&bytes, code.password()).map_err(|e| e.to_string())
+}
+
+/// Результат `backup-key` с подтверждением кода через stdin.
+struct BackupRun {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Запустить `backup-key --allow-redirect`, дождаться кода в stdout и ответить на запрос
+/// подтверждения строками, которые вернёт `answer(код)`.
+fn backup_key_confirm(
+    user: &User,
+    out: &Path,
+    extra: &[&str],
+    answer: impl Fn(&str) -> String,
+) -> BackupRun {
+    let mut args = vec![
+        "backup-key",
+        "--allow-redirect",
+        "--out",
+        out.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    // До ответа на подтверждение целевой файл не должен меняться (его нет, либо он прежний).
+    let before = std::fs::read(out).ok();
+    let mut child = user
+        .cmd(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut stdout = String::new();
+    let mut code = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        stdout.push_str(&line);
+        if line.starts_with("    ") && line.trim().len() > 20 {
+            code = Some(line.trim().to_string());
+            break;
+        }
+    }
+    // Код уже показан, а ответа ещё нет: настоящий файл не создан и не заменён.
+    assert_eq!(
+        std::fs::read(out).ok(),
+        before,
+        "целевой файл изменился до подтверждения кода"
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    if let Some(code) = &code {
+        // Ошибка записи возможна, если процесс уже закрыл stdin, — это не ошибка теста.
+        let _ = stdin.write_all(answer(code).as_bytes());
+    }
+    drop(stdin);
+    std::io::Read::read_to_string(&mut reader, &mut stdout).unwrap();
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    let status = child.wait().unwrap();
+    BackupRun {
+        success: status.success(),
+        stdout,
+        stderr,
+    }
+}
+
+/// Верный ответ: последняя группа кода (в нижнем регистре — нормализация).
+fn last_group(code: &str) -> String {
+    format!("{}\n", code.rsplit('-').next().unwrap().to_lowercase())
+}
+
+/// Три неверных ответа (символа «0» нет в алфавите кода).
+fn wrong_answers(_: &str) -> String {
+    "0000\n0000\n0000\n".into()
+}
+
+/// `backup-key`: файл с правами 0600, расшифровывается выведенным кодом, не
+/// перезаписывается без `--force`, не оставляет временных файлов.
+#[test]
+fn backup_key_writes_private_file_and_refuses_overwrite() {
+    let dir = tmp_dir("backup");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    let account_id = field(&bob.ok(&["whoami"]), "account_id:");
+    let file = dir.join("key.backup");
+    let file_arg = file.to_str().unwrap();
+
+    let run = backup_key_confirm(&bob, &file, &[], last_group);
+    assert!(run.success, "{}", run.stderr);
+    let shown = run.stdout;
+    let code = backup_code(&shown);
+    assert!(shown.contains("отпечаток аккаунта:"), "{shown}");
+    assert!(shown.contains("отозвать"), "{shown}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .starts_with("mkeybackup1.")
+    );
+    // Файл открывается выведенным кодом (в любом регистре, без дефисов) и содержит наш аккаунт.
+    let backup = open_backup(&file, &code).unwrap();
+    assert_eq!(backup.account_id(), account_id);
+    let alt = code.replace('-', "").to_lowercase();
+    assert!(open_backup(&file, &alt).is_ok());
+    assert!(open_backup(&file, "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA").is_err());
+    // В выводе нет ничего, кроме кода, из секретов: ключ аккаунта не печатается.
+    let secret_hex: String = backup
+        .account_sign()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert!(!shown.contains(&secret_hex));
+
+    // Без --force файл не заменяется.
+    let before = std::fs::read(&file).unwrap();
+    let out = bob.run(&["backup-key", "--allow-redirect", "--out", file_arg]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--force"), "{}", stderr(&out));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("КОД"));
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+
+    // С --force — заменяется новым файлом с новым кодом.
+    let run2 = backup_key_confirm(&bob, &file, &["--force"], last_group);
+    assert!(run2.success, "{}", run2.stderr);
+    let shown2 = run2.stdout;
+    let code2 = backup_code(&shown2);
+    assert_ne!(code, code2);
+    assert_ne!(std::fs::read(&file).unwrap(), before);
+    assert!(
+        open_backup(&file, &code).is_err(),
+        "старый код не должен подходить"
+    );
+    assert_eq!(open_backup(&file, &code2).unwrap().account_id(), account_id);
+
+    // Временных файлов не осталось.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // Несуществующая папка — ошибка, не паника.
+    let bad = dir.join("no-such-dir").join("k.backup");
+    assert!(
+        !bob.run(&[
+            "backup-key",
+            "--allow-redirect",
+            "--out",
+            bad.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Подключённое устройство ключа аккаунта не имеет: копию с него сделать нельзя.
+#[test]
+fn backup_key_is_refused_on_a_linked_device() {
+    let dir = tmp_dir("backup-linked");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    let phone = User::new(&dir, "bob-phone", &relay);
+    bob.ok(&["init"]);
+    let out = phone.run(&["link", "--name", "телефон"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let response = dir.join("response.json");
+    bob.ok(&[
+        "link-approve",
+        &code,
+        "--yes",
+        "-o",
+        response.to_str().unwrap(),
+    ]);
+    phone.ok(&["link-finish", "--response-file", response.to_str().unwrap()]);
+
+    let file = dir.join("phone.backup");
+    let out = phone.run(&[
+        "backup-key",
+        "--allow-redirect",
+        "--out",
+        file.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("нет ключа аккаунта"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!file.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Перенаправленный вывод: без `--allow-redirect` отказ до создания файла.
+#[test]
+fn backup_key_refuses_redirected_stdout_without_flag() {
+    let dir = tmp_dir("backup-redirect");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    let file = dir.join("key.backup");
+    let out = bob.run(&["backup-key", "--out", file.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("--allow-redirect"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("КОД"));
+    assert!(!file.exists());
+    let leftovers = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().contains("key.backup"));
+    assert!(!leftovers, "остались файлы копии");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Подтверждение кода: неверная группа три раза — ошибка, файл не создан; при `--force`
+/// прежняя копия не тронута; верная группа — успех.
+#[test]
+fn backup_key_requires_code_confirmation() {
+    let dir = tmp_dir("backup-confirm");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    let file = dir.join("key.backup");
+
+    // Новый файл: три неверных ввода.
+    let run = backup_key_confirm(&bob, &file, &[], wrong_answers);
+    assert!(!run.success);
+    assert!(run.stderr.contains("не подтверждён"), "{}", run.stderr);
+    assert!(!run.stdout.contains("записана:"), "{}", run.stdout);
+    assert!(!file.exists());
+
+    // Обрыв ввода (EOF без ответа) тоже провал.
+    let run = backup_key_confirm(&bob, &file, &[], |_| String::new());
+    assert!(!run.success);
+    assert!(!file.exists());
+
+    // Две ошибки и верный ответ с третьей попытки.
+    let run = backup_key_confirm(&bob, &file, &[], |c| {
+        format!("0000\n0000\n{}", last_group(c))
+    });
+    assert!(run.success, "{}", run.stderr);
+    let code = backup_code(&run.stdout);
+    assert!(open_backup(&file, &code).is_ok());
+    let before = std::fs::read(&file).unwrap();
+
+    // --force, но код не подтверждён: старая копия остаётся нетронутой.
+    let run = backup_key_confirm(&bob, &file, &["--force"], wrong_answers);
+    assert!(!run.success);
+    assert!(run.stderr.contains("не подтверждён"), "{}", run.stderr);
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    assert!(open_backup(&file, &code).is_ok());
+
+    // Временных файлов нет.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Прерывание SIGTERM во время ожидания подтверждения: временный файл удаляется,
+/// целевой не создаётся. Сиротский временный файл от прошлого запуска убирается со
+/// следующим запуском с предупреждением.
+#[cfg(unix)]
+#[test]
+fn backup_key_cleans_tmp_on_sigterm_and_removes_stale_tmp() {
+    let dir = tmp_dir("backup-signal");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    let file = dir.join("key.backup");
+    let tmp_files = |dir: &Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect()
+    };
+
+    let mut child = bob
+        .cmd(&[
+            "backup-key",
+            "--allow-redirect",
+            "--out",
+            file.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // wait() закрывает stdin ребёнка: EOF успел бы раньше сигнала дать отказ
+    // подтверждения (выход 1). Держим stdin открытым до конца процесса.
+    let stdin = child.stdin.take();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "код не показан");
+        if line.starts_with("    ") && line.trim().len() > 20 {
+            break;
+        }
+    }
+    assert_eq!(
+        tmp_files(&dir).len(),
+        1,
+        "временный файл должен существовать"
+    );
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = child.wait().unwrap();
+    drop(stdin);
+    assert_eq!(status.code(), Some(143));
+    assert!(!file.exists());
+    assert!(tmp_files(&dir).is_empty(), "{:?}", tmp_files(&dir));
+
+    // Сирота от прошлого запуска (например, после kill -9) убирается со следующим запуском.
+    let stale = dir.join(".key.backup.tmp-0123456789ab");
+    std::fs::write(&stale, b"left over").unwrap();
+    let run = backup_key_confirm(&bob, &file, &[], last_group);
+    assert!(run.success, "{}", run.stderr);
+    assert!(!stale.exists());
+    assert!(run.stderr.contains("прошлого запуска"), "{}", run.stderr);
+    assert!(file.exists());
+    assert!(tmp_files(&dir).is_empty());
+}
+
+/// Старый аккаунт с ID в виде UUID (не выведенным из ключа) продолжает работать.
+#[test]
+fn legacy_uuid_account_still_loads() {
+    let dir = tmp_dir("legacy-uuid");
+    let relay = start_relay();
+    for (name, with_sign_key) in [("with-key", true), ("no-sign-key", false)] {
+        let user = User::new(&dir, name, &relay);
+        let uuid = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
+        let id = crypto_core::Identity::generate(uuid);
+        {
+            let db = storage::Db::open(&user.db, Some(TEST_PASSWORD)).unwrap();
+            db.upsert_identity(&storage::IdentityRow {
+                account_id: uuid.into(),
+                device_id: 1,
+                username: None,
+                secret: id.x_secret_bytes(),
+                public: id.x_public_bytes(),
+                sign_secret: with_sign_key.then(|| id.sign_secret_bytes()),
+                sign_public: with_sign_key.then(|| id.sign_public_bytes()),
+                account_sign_secret: None,
+            })
+            .unwrap();
+        }
+        let out = user.run(&["whoami"]);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains(uuid));
+        // Второй запуск (список устройств уже сохранён) тоже проходит.
+        user.ok(&["whoami"]);
+    }
+}
