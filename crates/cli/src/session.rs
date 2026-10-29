@@ -23,6 +23,17 @@ use storage::{Db, Direction, OutboxItem};
 /// Сколько ждать ответа релея на публикацию списка устройств.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
+const SAME_VERSION_WARNING: &str = "! на релее список устройств той же версии v{v}, но с другим \
+     содержимым: проверьте `messenger devices`";
+
+/// Сохранённый список той же версии, что пришёл с релея, но другой по содержимому.
+fn same_version_other_content(
+    stored: Option<(u64, &SignedDeviceListB64)>,
+    wire: &SignedDeviceListB64,
+) -> bool {
+    stored.is_some_and(|(version, mine)| version == wire.version && mine != wire)
+}
+
 /// Текст ошибки, когда ответ на публикацию списка не пришёл: релей мог его принять.
 pub const PUBLISH_UNKNOWN: &str =
     "неизвестно, принял ли релей список; проверьте `messenger devices` после sync";
@@ -149,7 +160,11 @@ impl<'a> Session<'a> {
     }
 
     async fn wait_publish(&mut self, wire: SignedDeviceListB64) -> Result<()> {
-        self.publish_device_list(wire).await?;
+        // Отправка могла дойти до релея целиком или частично: при любой ошибке
+        // после этого результат неизвестен, а не «список не принят».
+        self.publish_device_list(wire)
+            .await
+            .map_err(|e| e.context(PUBLISH_UNKNOWN))?;
         let deadline = Instant::now() + PUBLISH_TIMEOUT;
         loop {
             match self.list_publish.take() {
@@ -161,7 +176,11 @@ impl<'a> Session<'a> {
             if left.is_zero() {
                 bail!("{PUBLISH_UNKNOWN}");
             }
-            match self.step(Some(left)).await? {
+            let step = self
+                .step(Some(left))
+                .await
+                .map_err(|e| e.context(PUBLISH_UNKNOWN))?;
+            match step {
                 Step::Handled => {}
                 Step::Timeout => bail!("{PUBLISH_UNKNOWN}"),
                 Step::Closed => bail!("релей закрыл соединение; {PUBLISH_UNKNOWN}"),
@@ -351,14 +370,12 @@ impl<'a> Session<'a> {
 
     fn on_device_list(&mut self, wire: &SignedDeviceListB64, ours: bool) {
         let account = wire.account_id.clone();
-        let before = if account == self.me.account_id() {
-            devices::stored(self.db, &account)
-                .ok()
-                .flatten()
-                .map(|(l, _)| l.version)
+        let before_full = if account == self.me.account_id() {
+            devices::stored(self.db, &account).ok().flatten()
         } else {
             None
         };
+        let before = before_full.as_ref().map(|(l, _)| l.version);
         match devices::accept(self.db, self.me, wire) {
             Ok(Some(list)) if account == self.me.account_id() => {
                 if let (Some(old), true) = (before, self.me.has_account_key() && !ours) {
@@ -377,19 +394,23 @@ impl<'a> Session<'a> {
                     eprintln!("! это устройство отключено от аккаунта");
                 }
             }
-            Ok(None) if account == self.me.account_id() && self.me.has_account_key() => {
-                if let Ok(Some((l, mine))) = devices::stored(self.db, &account) {
-                    if l.version == wire.version && mine != *wire {
-                        eprintln!(
-                            "! на релее список устройств той же версии v{}, но с другим \
-                             содержимым: проверьте `messenger devices`",
-                            l.version
-                        );
-                    }
+            Ok(_) => {}
+            Err(e) => {
+                let mine = self.me.has_account_key() && account == self.me.account_id();
+                if mine
+                    && same_version_other_content(
+                        before_full.as_ref().map(|(l, w)| (l.version, w)),
+                        wire,
+                    )
+                {
+                    eprintln!(
+                        "{}",
+                        SAME_VERSION_WARNING.replace("{v}", &wire.version.to_string())
+                    );
+                } else {
+                    eprintln!("! список устройств {account} отклонён: {e:#}");
                 }
             }
-            Ok(_) => {}
-            Err(e) => eprintln!("! список устройств {account} отклонён: {e:#}"),
         }
     }
 
@@ -485,5 +506,29 @@ impl<'a> Session<'a> {
 
     pub async fn close(self) {
         self.conn.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire(version: u64, sig: &str) -> SignedDeviceListB64 {
+        SignedDeviceListB64 {
+            account_id: "a".into(),
+            account_pub_b64: String::new(),
+            version,
+            devices: Vec::new(),
+            sig_b64: sig.into(),
+        }
+    }
+
+    #[test]
+    fn same_version_other_content_is_recognized() {
+        let mine = wire(3, "x");
+        assert!(same_version_other_content(Some((3, &mine)), &wire(3, "y")));
+        assert!(!same_version_other_content(Some((3, &mine)), &wire(3, "x")));
+        assert!(!same_version_other_content(Some((3, &mine)), &wire(2, "y")));
+        assert!(!same_version_other_content(None, &wire(3, "y")));
     }
 }

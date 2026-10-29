@@ -144,7 +144,10 @@ pub fn cmd_restore_key(path: &Path, file: &Path, name: &str, relay: &str) -> Res
         tokio::select! {
             r = publish_flow(relay, &backup, &pending, &sent) => r,
             _ = crate::shutdown_signal() => Err(if sent.get() {
-                Fail::Keep(anyhow!("прервано"))
+                Fail::Keep(anyhow!(
+                    "прервано после отправки: повторите `restore-key` с теми же файлом и \
+                     кодом, восстановление продолжится"
+                ))
             } else {
                 Fail::Early(anyhow!("прервано"))
             }),
@@ -160,7 +163,7 @@ pub fn cmd_restore_key(path: &Path, file: &Path, name: &str, relay: &str) -> Res
             if resumed {
                 return Err(e.context(
                     "запись о восстановлении сохранена: повторите `restore-key` с теми же \
-                     файлом и кодом",
+                     файлом и кодом или используйте новый профиль",
                 ));
             }
             clear_pending(&db);
