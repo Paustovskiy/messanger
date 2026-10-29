@@ -6,6 +6,7 @@ mod display;
 mod messaging;
 mod password;
 mod relay_client;
+mod restore;
 mod session;
 
 use anyhow::{Context, Result, bail};
@@ -14,8 +15,8 @@ use crypto_core::{Identity, envelope_id, verify_contact_card};
 use devices::{LinkPayload, LinkRequest, LinkResponse, LinkedContact};
 use messaging::Incoming;
 use protocol::{
-    ContactCardV2, DeviceInfo, Envelope, EnvelopeB64, MAX_DEVICE_NAME, MAX_DEVICES, PRIMARY_DEVICE,
-    b64, decode_fixed, normalize_username,
+    ContactCardV2, DeviceInfo, DeviceList, Envelope, EnvelopeB64, MAX_DEVICE_NAME, MAX_DEVICES,
+    PRIMARY_DEVICE, SignedDeviceListB64, b64, decode_fixed, normalize_username,
 };
 use session::{Session, Step};
 use std::collections::HashMap;
@@ -199,10 +200,25 @@ enum Command {
         allow_redirect: bool,
     },
 
-    /// На основном устройстве: отключить устройство от аккаунта.
+    /// Восстановить ключ аккаунта из резервной копии в новом профиле: профиль
+    /// становится новым устройством аккаунта. Код копии спрашивается скрыто
+    /// (или берётся из MESSENGER_BACKUP_CODE).
+    RestoreKey {
+        /// Файл резервной копии (`backup-key`).
+        #[arg(long)]
+        file: PathBuf,
+        /// Как назвать устройство (видно в `messenger devices`).
+        #[arg(long, default_value = "восстановленное устройство")]
+        name: String,
+    },
+
+    /// На устройстве с ключом аккаунта: отключить другое устройство от аккаунта.
     Unlink {
         /// Номер устройства (см. `messenger devices`).
         device_id: u32,
+        /// Не спрашивать подтверждение.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -234,6 +250,9 @@ fn run() -> Result<()> {
         Command::SetPassword => return cmd_set_password(&path),
         Command::RemovePassword => return cmd_remove_password(&path),
         Command::Link { name, no_password } => return cmd_link(&path, name, *no_password),
+        Command::RestoreKey { file, name } => {
+            return restore::cmd_restore_key(&path, file, name, &cli.relay);
+        }
         _ => {}
     }
 
@@ -242,7 +261,8 @@ fn run() -> Result<()> {
         Command::Init { .. }
         | Command::SetPassword
         | Command::RemovePassword
-        | Command::Link { .. } => unreachable!(),
+        | Command::Link { .. }
+        | Command::RestoreKey { .. } => unreachable!(),
         Command::Whoami => cmd_whoami(&db, &cli),
         Command::SetUsername { username } => cmd_set_username(&db, &username),
         Command::ExportContact { out } => cmd_export_contact(&db, out),
@@ -279,7 +299,7 @@ fn run() -> Result<()> {
             force,
             allow_redirect,
         } => backup::cmd_backup_key(&db, &out, force, allow_redirect),
-        Command::Unlink { device_id } => cmd_unlink(&db, &cli.relay, device_id),
+        Command::Unlink { device_id, yes } => cmd_unlink(&db, &cli.relay, device_id, yes),
     }
 }
 
@@ -287,22 +307,28 @@ fn run() -> Result<()> {
 // Личность
 // ---------------------------------------------------------------------------
 
+const LINK_UNFINISHED: &str = "устройство ещё не подключено: разрешите подключение на основном \
+     устройстве (`messenger link-approve`) и завершите здесь (`messenger link-finish`)";
+
+const RESTORE_UNFINISHED: &str = "восстановление ключа не завершено — повторите \
+     `messenger restore-key …` в этом профиле";
+
 /// Загрузить свою личность (ключи этого устройства). Личность из старой
 /// версии без ключа подписи автоматически получает его, а основное
 /// устройство — список устройств аккаунта.
 fn load_identity(db: &Db) -> Result<(IdentityRow, Identity)> {
     let Some(mut row) = db.get_local_identity()? else {
+        if db.pending_restore()?.is_some() {
+            bail!("{RESTORE_UNFINISHED}");
+        }
         if db.pending_link()?.is_some() {
-            bail!(
-                "устройство ещё не подключено: разрешите подключение на основном устройстве \
-                 (`messenger link-approve`) и завершите здесь (`messenger link-finish`)"
-            );
+            bail!("{LINK_UNFINISHED}");
         }
         bail!("личность ещё не создана — сначала выполните `messenger init`");
     };
 
     let sign_secret = match row.sign_secret {
-        Some(s) => s,
+        Some(s) => zeroize::Zeroizing::new(s),
         None => {
             let upgraded =
                 Identity::from_secrets(&row.account_id, row.secret, crypto_core::random_bytes());
@@ -313,14 +339,14 @@ fn load_identity(db: &Db) -> Result<(IdentityRow, Identity)> {
                 "Обратите внимание: ваша личность создана старой версией и не имела ключа подписи. \
                  Он только что сгенерирован — разошлите контактам свежую карточку (`messenger export-contact`)."
             );
-            upgraded.sign_secret_bytes()
+            zeroize::Zeroizing::new(upgraded.sign_secret_bytes())
         }
     };
 
-    let mut id =
-        Identity::from_secrets(&row.account_id, row.secret, sign_secret).with_device(row.device_id);
-    if let Some(account_secret) = row.account_sign_secret {
-        id = id.with_account_key(account_secret);
+    let mut id = Identity::from_secrets(&row.account_id, row.secret, *sign_secret)
+        .with_device(row.device_id);
+    if let Some(account_secret) = row.account_sign_secret.as_ref() {
+        id = id.with_account_key(*account_secret);
     }
     devices::check_account_key(db, &id)?;
     if id.device_id() == PRIMARY_DEVICE {
@@ -364,6 +390,20 @@ fn cmd_init(path: &Path, profile: &str, no_password: bool) -> Result<()> {
                 );
             }
             return Ok(());
+        }
+        if db.pending_restore()?.is_some() {
+            bail!(
+                "{RESTORE_UNFINISHED}. Новую личность в этом профиле создать нельзя — \
+                 иначе пропадут ключи, ожидающие завершения; либо используйте новый профиль \
+                 (`messenger --profile <имя> init`)"
+            );
+        }
+        if db.pending_link()?.is_some() {
+            bail!(
+                "{LINK_UNFINISHED}. Новую личность в этом профиле создать нельзя — \
+                 иначе пропадут ключи, ожидающие завершения; либо используйте новый профиль \
+                 (`messenger --profile <имя> init`)"
+            );
         }
         if state == FileState::Encrypted {
             // Зашифрованная база без личности: пароль уже введён, просто создаём.
@@ -485,18 +525,28 @@ fn cmd_set_username(db: &Db, username: &str) -> Result<()> {
 
 fn cmd_export_contact(db: &Db, out: Option<PathBuf>) -> Result<()> {
     let (row, id) = load_identity(db)?;
-    if id.device_id() != PRIMARY_DEVICE {
+    if !id.has_account_key() {
         bail!(
-            "карточку подписывает ключ аккаунта, а он есть только на основном устройстве — \
-             выгрузите карточку там"
+            "карточку подписывает ключ аккаунта, а его на этом устройстве нет — \
+             выгрузите карточку на устройстве с ключом аккаунта"
         );
     }
-    let mut card = id.contact_card(row.username);
-    // Свежий предключ в карточке позволяет начать переписку даже без релея.
-    let (spk, _) = messaging::ensure_signed_prekey(db, &id)?;
-    card.signed_prekey = Some(messaging::signed_prekey_wire(&spk));
+    let (list, list_wire) = devices::own_list(db, &id)?;
+    let mut card = if id.device_id() == PRIMARY_DEVICE {
+        let mut card = id.contact_card(row.username.clone());
+        // Свежий предключ в карточке позволяет начать переписку даже без релея.
+        let (spk, _) = messaging::ensure_signed_prekey(db, &id)?;
+        card.signed_prekey = Some(messaging::signed_prekey_wire(&spk));
+        card
+    } else {
+        // Предключ принадлежит устройству №1, поэтому в такой карточке его нет.
+        let primary = list
+            .device(PRIMARY_DEVICE)
+            .context("в списке устройств нет основного устройства")?;
+        id.account_contact_card(row.username.clone(), primary.x25519_pub)?
+    };
     // Список устройств: собеседник сразу будет писать на все.
-    card.devices = Some(devices::own_list(db, &id)?.1);
+    card.devices = Some(list_wire);
     let json = serde_json::to_string_pretty(&card)?;
     match out {
         Some(path) => {
@@ -824,7 +874,10 @@ fn cmd_receive(db: &Db, envelope: Option<String>, file: Option<PathBuf>) -> Resu
 
 fn cmd_listen(db: &Db, relay: &str) -> Result<()> {
     let (row, me) = load_identity(db)?;
-    let name = row.username.unwrap_or(row.account_id);
+    let name = row
+        .username
+        .clone()
+        .unwrap_or_else(|| row.account_id.clone());
 
     runtime()?.block_on(async {
         let listen = async {
@@ -1034,8 +1087,8 @@ fn cmd_devices(db: &Db) -> Result<()> {
     Ok(())
 }
 
-/// Шаг 1 (новое устройство): завести ключи и выдать код подключения.
-fn cmd_link(path: &Path, name: &str, no_password: bool) -> Result<()> {
+/// Проверить название устройства; возвращает его без пробелов по краям.
+fn check_device_name(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty()
         || name.chars().count() > MAX_DEVICE_NAME
@@ -1043,6 +1096,12 @@ fn cmd_link(path: &Path, name: &str, no_password: bool) -> Result<()> {
     {
         bail!("название устройства — от 1 до {MAX_DEVICE_NAME} символов");
     }
+    Ok(name)
+}
+
+/// Шаг 1 (новое устройство): завести ключи и выдать код подключения.
+fn cmd_link(path: &Path, name: &str, no_password: bool) -> Result<()> {
+    let name = check_device_name(name)?;
     let db = match storage::file_state(path)? {
         FileState::Missing => {
             let pw = if no_password {
@@ -1061,6 +1120,12 @@ fn cmd_link(path: &Path, name: &str, no_password: bool) -> Result<()> {
         bail!(
             "в этом профиле уже есть личность. Новое устройство подключают в новом, \
              пустом профиле: `messenger --profile <имя> link`"
+        );
+    }
+    if db.pending_restore()?.is_some() {
+        bail!(
+            "{RESTORE_UNFINISHED}. Подключать устройство в этом профиле нельзя — \
+             используйте новый профиль (`messenger --profile <имя> link`)"
         );
     }
     let link = match db.pending_link()? {
@@ -1087,7 +1152,7 @@ fn cmd_link(path: &Path, name: &str, no_password: bool) -> Result<()> {
     eprintln!();
     eprintln!("Отпечаток этого устройства: {}", keys.fingerprint());
     eprintln!();
-    eprintln!("Дальше, на основном устройстве:");
+    eprintln!("Дальше, на устройстве с ключом аккаунта:");
     eprintln!("  messenger link-approve <код выше> -o link-response.json");
     eprintln!("Оно покажет отпечаток — он должен совпасть с этим.");
     eprintln!("Затем здесь: messenger link-finish --response-file link-response.json");
@@ -1103,22 +1168,13 @@ fn cmd_link_approve(
     yes: bool,
 ) -> Result<()> {
     let (row, me) = load_identity(db)?;
-    if me.device_id() != PRIMARY_DEVICE {
-        bail!("подключать устройства может только основное устройство аккаунта");
+    if !me.has_account_key() {
+        bail!("подключать устройства может только устройство с ключом аккаунта");
     }
     let req = LinkRequest::decode(code)?;
     let (x25519_pub, ed25519_pub) = req.keys()?;
-    let (mut list, _) = devices::own_list(db, &me)?;
-    if let Some(d) = list
-        .devices
-        .iter()
-        .find(|d| d.x25519_pub == x25519_pub || d.ed25519_pub == ed25519_pub)
-    {
-        bail!("это устройство уже подключено (№{})", d.device_id);
-    }
-    if list.devices.len() >= MAX_DEVICES {
-        bail!("в аккаунте уже {MAX_DEVICES} устройств — отключите лишнее (`messenger unlink`)");
-    }
+    let (list, _) = devices::own_list(db, &me)?;
+    check_can_add(&list, &x25519_pub, &ed25519_pub, &req.name)?;
 
     let fingerprint = crypto_core::fingerprint(&x25519_pub, &ed25519_pub);
     println!("Новое устройство «{}»", req.name);
@@ -1138,27 +1194,34 @@ fn cmd_link_approve(
         }
     }
 
-    list.version += 1;
-    // Номер не должен совпасть с номером уже отключённого устройства, а в списке
-    // отключённых нет. Версия списка растёт при каждом изменении (и добавлении, и
-    // отключении), поэтому номер не меньше новой версии никогда не повторится.
-    let by_version = u32::try_from(list.version).context("слишком много изменений списка")?;
-    let after_max = list
+    // Список берём свежий с релея: его мог изменить другой держатель ключа.
+    // Локально новый список сохранится только после ответа релея.
+    // Если релей уже принял этот список, а ответ потерялся, устройство в свежем
+    // списке уже есть: ничего не публикуем, а выдаём ответ заново.
+    let mut repeated = false;
+    let (list, wire) = change_own_list(db, relay, &me, |cur| {
+        if let Approval::Existing = check_can_add(cur, &x25519_pub, &ed25519_pub, &req.name)? {
+            repeated = true;
+            return Ok(None);
+        }
+        repeated = false;
+        let (version, device_id) = devices::next_device_number(cur)?;
+        let mut new = cur.clone();
+        new.version = version;
+        new.devices.push(DeviceInfo {
+            device_id,
+            x25519_pub,
+            ed25519_pub,
+            name: req.name.clone(),
+        });
+        Ok(Some(new))
+    })?;
+    let device_id = list
         .devices
         .iter()
+        .find(|d| d.x25519_pub == x25519_pub && d.ed25519_pub == ed25519_pub)
         .map(|d| d.device_id)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .context("закончились номера устройств")?;
-    let device_id = by_version.max(after_max);
-    list.devices.push(DeviceInfo {
-        device_id,
-        x25519_pub,
-        ed25519_pub,
-        name: req.name.clone(),
-    });
-    let wire = devices::save_own(db, &me, &list)?;
+        .context("устройство не попало в опубликованный список")?;
 
     let mut contacts = vec![];
     for c in db.list_contacts()? {
@@ -1185,7 +1248,7 @@ fn cmd_link_approve(
         &LinkPayload {
             account_id: me.account_id().into(),
             device_id,
-            username: row.username,
+            username: row.username.clone(),
             devices: wire,
             contacts,
         },
@@ -1197,9 +1260,15 @@ fn cmd_link_approve(
         None => println!("{json}"),
     }
 
-    publish_own_list(db, relay, &me);
     eprintln!();
-    eprintln!("Устройство «{}» добавлено как №{device_id}.", req.name);
+    if repeated {
+        eprintln!(
+            "Устройство «{}» уже подключено как №{device_id} — ответ выдан повторно.",
+            req.name
+        );
+    } else {
+        eprintln!("Устройство «{}» добавлено как №{device_id}.", req.name);
+    }
     match out {
         Some(path) => eprintln!(
             "Перенесите {} на новое устройство и выполните там `messenger link-finish --response-file <файл>`.",
@@ -1210,30 +1279,114 @@ fn cmd_link_approve(
     Ok(())
 }
 
-/// Опубликовать свой список устройств на релее (основное устройство делает
-/// это само при каждом подключении — здесь просто не откладываем).
-fn publish_own_list(db: &Db, relay: &str, me: &Identity) {
-    let result = runtime().and_then(|rt| {
-        rt.block_on(async {
-            let mut s = Session::open(relay, db, me).await?;
-            // Релей отвечает списком на публикацию; публикует сессия сама,
-            // увидев, что на релее версия старее.
+/// Что делать с кодом подключения при данном списке устройств.
+enum Approval {
+    /// Устройства в списке нет — его можно добавить.
+    New,
+    /// Это устройство уже в списке (точно те же ключи и имя): повтор после потерянного ответа.
+    Existing,
+}
+
+fn check_can_add(
+    list: &DeviceList,
+    x25519_pub: &[u8; 32],
+    ed25519_pub: &[u8; 32],
+    name: &str,
+) -> Result<Approval> {
+    if let Some(d) = list
+        .devices
+        .iter()
+        .find(|d| d.x25519_pub == *x25519_pub || d.ed25519_pub == *ed25519_pub)
+    {
+        if d.x25519_pub == *x25519_pub && d.ed25519_pub == *ed25519_pub && d.name == name {
+            return Ok(Approval::Existing);
+        }
+        bail!("это устройство уже подключено (№{})", d.device_id);
+    }
+    if list.devices.len() >= MAX_DEVICES {
+        bail!("в аккаунте уже {MAX_DEVICES} устройств — отключите лишнее (`messenger unlink`)");
+    }
+    Ok(Approval::New)
+}
+
+/// Сколько раз пересобирать список, если пока мы публиковали, его изменили на релее.
+const LIST_ATTEMPTS: usize = 3;
+
+/// Изменить свой список устройств через релей: взять свежий список с релея,
+/// собрать новый (`change`), опубликовать и только после ответа релея сохранить
+/// у себя. Без релея список не меняется. `change` вернёт `None`, если менять
+/// нечего: тогда ничего не публикуется, а результат — свежий список с релея.
+fn change_own_list(
+    db: &Db,
+    relay: &str,
+    me: &Identity,
+    mut change: impl FnMut(&DeviceList) -> Result<Option<DeviceList>>,
+) -> Result<(DeviceList, SignedDeviceListB64)> {
+    let offline = "список устройств не изменён";
+    runtime()?.block_on(async {
+        let mut s = match Session::open(relay, db, me).await {
+            Ok(s) => s,
+            Err(e) if format!("{e:#}").contains(protocol::ERR_NOT_IN_DEVICE_LIST) => {
+                bail!("это устройство отключено от аккаунта")
+            }
+            Err(e) => return Err(e.context(format!("релей недоступен, {offline}"))),
+        };
+        wait_for(&mut s, ACCEPT_TIMEOUT, |s| s.synced || s.removed).await?;
+        if s.removed {
+            bail!("это устройство отключено от аккаунта");
+        }
+        if !s.synced {
+            bail!("релей не ответил, {offline}");
+        }
+        let mut result = Err(anyhow::anyhow!("не удалось опубликовать список устройств"));
+        for _ in 0..LIST_ATTEMPTS {
+            // Свежий список с релея (при необходимости on_device_list его примет).
+            s.device_lists.remove(me.account_id());
+            s.fetch_device_list(me.account_id()).await?;
             wait_for(&mut s, ACCEPT_TIMEOUT, |s| {
                 s.device_lists.contains(me.account_id())
             })
             .await?;
-            let ok = s.device_lists.contains(me.account_id());
-            s.close().await;
-            Ok(ok)
-        })
-    });
-    match result {
-        Ok(true) => eprintln!("Список устройств опубликован на релее."),
-        Ok(false) | Err(_) => eprintln!(
-            "⚠ релей недоступен: список устройств уйдёт при следующем подключении \
-             (`messenger sync` или `messenger listen`). До этого новое устройство не войдёт."
-        ),
-    }
+            if !s.device_lists.contains(me.account_id()) {
+                result = Err(anyhow::anyhow!(
+                    "релей не прислал список устройств, {offline}"
+                ));
+                break;
+            }
+            let (cur, cur_wire) = devices::own_list(db, me)?;
+            let Some(new) = change(&cur)? else {
+                result = Ok((cur, cur_wire));
+                break;
+            };
+            protocol::backup::check_list_update(Some(&cur), &new)
+                .map_err(|e| anyhow::anyhow!("новый список устройств недопустим: {e}"))?;
+            let wire = me.sign_device_list(&new)?;
+            match s.publish_own(wire.clone()).await {
+                Ok(()) => {
+                    // Обычно список уже сохранён при ответе релея; accept это повторно не сделает.
+                    devices::accept(db, me, &wire)?;
+                    result = Ok((new, wire));
+                    break;
+                }
+                Err(e) if format!("{e:#}").contains(protocol::ERR_STALE_DEVICE_LIST) => {
+                    result = Err(anyhow::anyhow!(
+                        "список устройств на релее изменился во время публикации, \
+                         повторите команду"
+                    ));
+                }
+                Err(e) if format!("{e:#}").contains(session::PUBLISH_UNKNOWN) => {
+                    result = Err(e);
+                    break;
+                }
+                Err(e) => {
+                    result = Err(e.context(format!("релей не принял список, {offline}")));
+                    break;
+                }
+            }
+        }
+        s.close().await;
+        result
+    })
 }
 
 /// Шаг 3 (новое устройство): проверить ответ и стать устройством аккаунта.
@@ -1313,7 +1466,7 @@ fn cmd_link_finish(db: &Db, response: Option<String>, file: Option<PathBuf>) -> 
         "отпечаток аккаунта: {}",
         devices::account_fingerprint(&list)
     );
-    println!("Сверьте его с `messenger whoami` на основном устройстве.");
+    println!("Сверьте его с `messenger whoami` на устройстве с ключом аккаунта.");
     println!("Перенесено контактов: {}.", payload.contacts.len());
     println!();
     println!("Дальше: `messenger listen` — устройство выйдет в сеть и опубликует свои предключи.");
@@ -1322,23 +1475,54 @@ fn cmd_link_finish(db: &Db, response: Option<String>, file: Option<PathBuf>) -> 
 
 /// Отключить устройство: убрать из списка, релей закроет его соединения и
 /// перестанет пускать, собеседники перестанут ему писать.
-fn cmd_unlink(db: &Db, relay: &str, device_id: u32) -> Result<()> {
+fn cmd_unlink(db: &Db, relay: &str, device_id: u32, yes: bool) -> Result<()> {
     let (_, me) = load_identity(db)?;
-    if me.device_id() != PRIMARY_DEVICE {
-        bail!("отключать устройства может только основное устройство аккаунта");
+    if !me.has_account_key() {
+        bail!("отключать устройства может только устройство с ключом аккаунта");
+    }
+    if device_id == me.device_id() {
+        bail!("нельзя отключить это устройство");
     }
     if device_id == PRIMARY_DEVICE {
         bail!("основное устройство отключить нельзя: его ключ — это ключ аккаунта");
     }
-    let (mut list, _) = devices::own_list(db, &me)?;
-    let Some(pos) = list.devices.iter().position(|d| d.device_id == device_id) else {
+    let (list, _) = devices::own_list(db, &me)?;
+    let Some(target) = list.device(device_id) else {
         bail!("устройства №{device_id} нет в аккаунте — см. `messenger devices`");
     };
-    let removed = list.devices.remove(pos);
-    list.version += 1;
-    devices::save_own(db, &me, &list)?;
-    println!("Устройство №{device_id} «{}» отключено.", removed.name);
-    publish_own_list(db, relay, &me);
+    let name = target.name.clone();
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("подтвердите отключение флагом --yes");
+        }
+        println!("Устройство №{device_id} «{name}»");
+        println!(
+            "Если на этом устройстве восстановлен ключ аккаунта, отключение не отнимает ключ: \
+             оно сможет снова добавить себя."
+        );
+        eprint!("Отключить? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        if !matches!(
+            answer.trim().to_lowercase().as_str(),
+            "y" | "yes" | "д" | "да"
+        ) {
+            bail!("отключение отменено");
+        }
+    }
+    change_own_list(db, relay, &me, |cur| {
+        let mut new = cur.clone();
+        let Some(pos) = new.devices.iter().position(|d| d.device_id == device_id) else {
+            bail!("устройства №{device_id} уже нет в аккаунте — см. `messenger devices`");
+        };
+        new.devices.remove(pos);
+        new.version = new
+            .version
+            .checked_add(1)
+            .context("слишком много изменений списка")?;
+        Ok(Some(new))
+    })?;
+    println!("Устройство №{device_id} «{name}» отключено.");
     Ok(())
 }
 

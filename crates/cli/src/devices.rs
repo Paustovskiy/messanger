@@ -3,9 +3,9 @@
 //!
 //! Каждое устройство — отдельная пара ключей и отдельные сессии. Какие
 //! устройства принадлежат аккаунту, говорит список, подписанный ключом
-//! аккаунта (это ключ основного устройства, №1). Список только растёт по
-//! версиям: старый список (например, подсунутый релеем, чтобы вернуть
-//! отключённое устройство) не принимается.
+//! аккаунта (это ключ основного устройства, №1, либо копия этого ключа на другом
+//! устройстве). Список только растёт по версиям: старый список (например,
+//! подсунутый релеем, чтобы вернуть отключённое устройство) не принимается.
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -84,15 +84,6 @@ pub fn own_list(db: &Db, me: &Identity) -> Result<(DeviceList, SignedDeviceListB
     Ok((list, wire))
 }
 
-/// Подписать и сохранить новую версию своего списка (только основное устройство).
-pub fn save_own(db: &Db, me: &Identity, list: &DeviceList) -> Result<SignedDeviceListB64> {
-    let wire = me
-        .sign_device_list(list)
-        .context("менять список устройств может только основное устройство")?;
-    accept(db, me, &wire)?;
-    Ok(wire)
-}
-
 /// Ключ аккаунта, которым должен быть подписан его список устройств.
 fn account_key(db: &Db, me: &Identity, account_id: &str) -> Result<Option<[u8; 32]>> {
     if account_id == me.account_id() {
@@ -118,6 +109,14 @@ pub fn accept(db: &Db, me: &Identity, wire: &SignedDeviceListB64) -> Result<Opti
     let list = verify_device_list(wire, account_id, known.as_ref())
         .context("список устройств не прошёл проверку подписи")?;
     let old = stored(db, account_id)?;
+    if let Some((old, _)) = &old {
+        // Старый список (например, из старой карточки) молча пропускаем.
+        if old.version > list.version {
+            return Ok(None);
+        }
+        protocol::backup::check_list_update(Some(old), &list)
+            .map_err(|e| anyhow::anyhow!("список устройств отклонён: {e}"))?;
+    }
     db.immediate(|| {
         if !db.save_device_list(account_id, list.version, &serde_json::to_string(wire)?)? {
             return Ok(None);
@@ -133,6 +132,26 @@ pub fn accept(db: &Db, me: &Identity, wire: &SignedDeviceListB64) -> Result<Opti
         db.drop_outbox_except(account_id, &keep)?;
         Ok(Some(list.clone()))
     })
+}
+
+/// Версия и номер для нового устройства (§4а): список растёт на единицу, а номер не
+/// меньше новой версии и больше всех номеров в списке, поэтому номер отключённого
+/// устройства никогда не повторится.
+pub fn next_device_number(list: &DeviceList) -> Result<(u64, u32)> {
+    let version = list
+        .version
+        .checked_add(1)
+        .context("слишком много изменений списка")?;
+    let by_version = u32::try_from(version).context("слишком много изменений списка")?;
+    let after_max = list
+        .devices
+        .iter()
+        .map(|d| d.device_id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .context("закончились номера устройств")?;
+    Ok((version, by_version.max(after_max)))
 }
 
 fn peer(account_id: &str, d: &DeviceInfo) -> PeerKeys {
@@ -297,7 +316,9 @@ fn link_signing_bytes(payload: &str) -> Vec<u8> {
 impl LinkResponse {
     pub fn sign(me: &Identity, payload: &LinkPayload) -> Result<Self> {
         let payload = serde_json::to_string(payload)?;
-        let sig = me.sign(&link_signing_bytes(&payload));
+        let sig = me
+            .sign_as_account(&link_signing_bytes(&payload))
+            .context("ответ на подключение подписывает только устройство с ключом аккаунта")?;
         Ok(Self {
             payload,
             sig_b64: b64(sig),
@@ -427,5 +448,119 @@ mod tests {
         let dev = device_with_key(&primary, &primary);
         let err = check_account_key(&db, &dev).unwrap_err().to_string();
         assert!(err.contains("не совпадает"), "{err}");
+    }
+
+    fn list_of(primary: &Identity, version: u64, extra: &[u32]) -> DeviceList {
+        let mut devices = vec![primary.device_info(PRIMARY_NAME)];
+        for &id in extra {
+            devices.push(
+                Identity::generate(primary.account_id())
+                    .with_device(id)
+                    .device_info(format!("d{id}")),
+            );
+        }
+        DeviceList {
+            account_id: primary.account_id().into(),
+            account_pub: primary.sign_public_bytes(),
+            version,
+            devices,
+        }
+    }
+
+    fn put(db: &Db, me: &Identity, list: &DeviceList) -> Result<Option<DeviceList>> {
+        accept(db, me, &me.sign_device_list(list).unwrap())
+    }
+
+    #[test]
+    fn accept_skips_older_list_silently() {
+        let db = Db::open_in_memory().unwrap();
+        let me = Identity::generate_new();
+        put(&db, &me, &list_of(&me, 1, &[])).unwrap();
+        put(&db, &me, &list_of(&me, 3, &[4])).unwrap();
+        assert!(put(&db, &me, &list_of(&me, 2, &[])).unwrap().is_none());
+        assert_eq!(stored(&db, me.account_id()).unwrap().unwrap().0.version, 3);
+    }
+
+    #[test]
+    fn accept_rejects_same_version_with_other_content() {
+        let db = Db::open_in_memory().unwrap();
+        let me = Identity::generate_new();
+        put(&db, &me, &list_of(&me, 2, &[3])).unwrap();
+        let err = put(&db, &me, &list_of(&me, 2, &[5]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("отклонён"), "{err}");
+    }
+
+    #[test]
+    fn accept_rejects_changed_primary_entry() {
+        let db = Db::open_in_memory().unwrap();
+        let me = Identity::generate_new();
+        put(&db, &me, &list_of(&me, 1, &[])).unwrap();
+        let mut list = list_of(&me, 2, &[]);
+        list.devices[0].name = "другое имя".into();
+        let err = put(&db, &me, &list).unwrap_err().to_string();
+        assert!(err.contains("отклонён"), "{err}");
+    }
+
+    #[test]
+    fn accept_takes_normal_update() {
+        let db = Db::open_in_memory().unwrap();
+        let me = Identity::generate_new();
+        put(&db, &me, &list_of(&me, 1, &[])).unwrap();
+        let got = put(&db, &me, &list_of(&me, 2, &[2])).unwrap().unwrap();
+        assert_eq!(got.version, 2);
+    }
+
+    fn numbered(version: u64, ids: &[u32]) -> DeviceList {
+        let me = Identity::generate_new();
+        let mut l = list_of(&me, version, &[]);
+        l.devices = ids
+            .iter()
+            .map(|&id| {
+                Identity::generate(me.account_id())
+                    .with_device(id)
+                    .device_info("x")
+            })
+            .collect();
+        l
+    }
+
+    #[test]
+    fn next_device_number_follows_rule() {
+        assert_eq!(
+            next_device_number(&numbered(5, &[1, 2, 3])).unwrap(),
+            (6, 6)
+        );
+        assert_eq!(next_device_number(&numbered(2, &[1, 7])).unwrap(), (3, 8));
+    }
+
+    #[test]
+    fn next_device_number_overflow_is_error() {
+        assert!(next_device_number(&numbered(u64::MAX, &[1])).is_err());
+        assert!(next_device_number(&numbered(u64::from(u32::MAX), &[1])).is_err());
+        assert!(next_device_number(&numbered(2, &[1, u32::MAX])).is_err());
+    }
+
+    #[test]
+    fn link_response_signed_by_account_key_device_verifies() {
+        let primary = Identity::generate_new();
+        let (_, wire) = {
+            let db = Db::open_in_memory().unwrap();
+            own_list(&db, &primary).unwrap()
+        };
+        let phone = device_with_key(&primary, &primary);
+        let payload = LinkPayload {
+            account_id: primary.account_id().into(),
+            device_id: 3,
+            username: None,
+            devices: wire,
+            contacts: vec![],
+        };
+        let resp = LinkResponse::sign(&phone, &payload).unwrap();
+        resp.verify().unwrap();
+        // Устройство без ключа аккаунта подписать не может.
+        let plain = Identity::generate(primary.account_id()).with_device(4);
+        assert!(LinkResponse::sign(&plain, &payload).is_err());
     }
 }

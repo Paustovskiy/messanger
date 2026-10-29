@@ -796,7 +796,9 @@ fn pending_restore_roundtrip() {
     let q = PendingRestore {
         name: "другой".into(),
         account_secret: [9; 32],
-        ..p
+        account_id: p.account_id.clone(),
+        x_secret: p.x_secret,
+        sign_secret: p.sign_secret,
     };
     db.set_pending_restore(&q).unwrap();
     assert_same_restore(&db.pending_restore().unwrap().unwrap(), &q);
@@ -863,4 +865,50 @@ fn assert_same_restore(a: &PendingRestore, b: &PendingRestore) {
     assert_eq!(a.x_secret, b.x_secret);
     assert_eq!(a.sign_secret, b.sign_secret);
     assert_eq!(a.name, b.name);
+}
+
+#[test]
+fn secret_rows_zeroize_and_debug_has_no_secrets() {
+    let mut id = IdentityRow {
+        account_id: "acc".into(),
+        device_id: 2,
+        username: None,
+        secret: [1; 32],
+        public: [2; 32],
+        sign_secret: Some([3; 32]),
+        sign_public: Some([4; 32]),
+        account_sign_secret: Some([5; 32]),
+    };
+    let mut link = PendingLink {
+        x_secret: [6; 32],
+        sign_secret: [7; 32],
+        name: "n".into(),
+    };
+    let mut restore = PendingRestore {
+        account_id: "acc".into(),
+        account_secret: [8; 32],
+        x_secret: [9; 32],
+        sign_secret: [10; 32],
+        name: "n".into(),
+    };
+    for text in [
+        format!("{id:?}"),
+        format!("{link:?}"),
+        format!("{restore:?}"),
+    ] {
+        for n in [1u8, 3, 5, 6, 7, 8, 9, 10] {
+            let arr = format!("{:?}", [n; 32]);
+            assert!(!text.contains(&arr[..8]), "{text}");
+        }
+    }
+    id.zeroize_secrets();
+    assert_eq!(id.secret, [0; 32]);
+    assert_eq!(id.sign_secret, Some([0; 32]));
+    assert_eq!(id.account_sign_secret, Some([0; 32]));
+    assert_eq!(id.public, [2; 32]);
+    link.zeroize_secrets();
+    assert_eq!((link.x_secret, link.sign_secret), ([0; 32], [0; 32]));
+    restore.zeroize_secrets();
+    assert_eq!(restore.account_secret, [0; 32]);
+    assert_eq!((restore.x_secret, restore.sign_secret), ([0; 32], [0; 32]));
 }

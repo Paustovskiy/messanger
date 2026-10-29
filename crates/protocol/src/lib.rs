@@ -37,6 +37,15 @@ const DOMAIN_DEVICE_LIST: &[u8] = b"messenger/device-list/v1";
 
 /// Номер основного устройства аккаунта: оно хранит ключ аккаунта.
 pub const PRIMARY_DEVICE: u32 = 1;
+
+/// Номер "устройства" для сессии ключом аккаунта: служебный вход только для
+/// чтения/публикации списка устройств. Обычное устройство получить 0 не может
+/// (`DeviceList::validate` его отвергает).
+pub const ACCOUNT_SESSION_DEVICE: u32 = 0;
+/// Ошибка релея: версия списка устройств устарела или конфликтует.
+pub const ERR_STALE_DEVICE_LIST: &str = "stale device list version";
+/// Ошибка релея: устройства нет в списке устройств аккаунта.
+pub const ERR_NOT_IN_DEVICE_LIST: &str = "this device is not in the account's device list";
 /// Сколько устройств может быть у одного аккаунта.
 pub const MAX_DEVICES: usize = 10;
 /// Максимальная длина названия устройства (символов).

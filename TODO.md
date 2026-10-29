@@ -19,3 +19,21 @@
   restore default signal handling). If `publish`, fsync or the read-back hangs
   (e.g. on NFS), Ctrl+C does nothing and only `kill -9` helps. At least document
   it in the code; ideally restore default handling or use a timeout.
+- [ ] **`same_file` on Windows compares only the size.** The non-unix
+  `same_file` (`crates/cli/src/backup.rs`) checks `is_file()` and `len()`, so
+  `create_locked` and `remove_stale_tmp` cannot tell two different files of the
+  same size apart (the unix version compares dev/ino). Compare the volume serial
+  number and file index (`GetFileInformationByHandle`) instead.
+
+## Account key
+
+- [ ] **Lost device #1 keeps receiving envelopes.** After `restore-key` device #1
+  stays in the list (its entry never changes and it cannot be unlinked), so
+  contacts keep encrypting to it and its queue on the relay fills up (30 days /
+  1000 messages). Needs an explicit "device #1 is gone" state or a way to replace
+  its entry.
+- [ ] **No account key rotation.** A stolen device with the account key, or a
+  leaked backup file together with its code, gives permanent control over the
+  account; `unlink` does not take the key away and a backup cannot be revoked. The
+  only way out is a new account. Needs a rotation protocol (new key, signed
+  hand-over, contacts re-pinning).

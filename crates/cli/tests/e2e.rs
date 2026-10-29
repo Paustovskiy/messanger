@@ -34,7 +34,8 @@ impl User {
             .env_remove("MESSENGER_DB");
         // Все тестовые базы зашифрованы — как у настоящего пользователя.
         c.env("MESSENGER_PASSWORD", TEST_PASSWORD)
-            .env_remove("MESSENGER_NEW_PASSWORD");
+            .env_remove("MESSENGER_NEW_PASSWORD")
+            .env_remove("MESSENGER_BACKUP_CODE");
         c
     }
 
@@ -580,7 +581,7 @@ fn second_device_joins_receives_and_is_unlinked() {
     }
 
     // Телефон потерян: Боб отключает его.
-    let out = bob.ok(&["unlink", "2"]);
+    let out = bob.ok(&["unlink", "2", "--yes"]);
     assert!(out.contains("отключено"), "{out}");
     assert!(!bob.ok(&["devices"]).contains("телефон"));
     let out = phone.run(&["sync"]);
@@ -594,8 +595,8 @@ fn second_device_joins_receives_and_is_unlinked() {
     let sent = alice.ok(&["send", "@bobby", "только ноутбуку", "--wait", "0"]);
     assert!(sent.contains("отправлено: @bobby\n"), "{sent}");
 
-    // Подключать и отключать может только основное устройство.
-    assert!(stderr(&phone.run(&["unlink", "1"])).contains("основное"));
+    // Подключать и отключать может только устройство с ключом аккаунта.
+    assert!(stderr(&phone.run(&["unlink", "1"])).contains("ключом аккаунта"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -636,10 +637,85 @@ fn unlinked_device_number_is_not_reused() {
             .collect()
     };
     let n1 = number(&first);
-    bob.ok(&["unlink", &n1]);
+    bob.ok(&["unlink", &n1, "--yes"]);
     let second = link("phone-b");
     let n2 = number(&second);
     assert_ne!(n1, n2, "номер отключённого устройства выдан повторно");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Подключает новое устройство и возвращает его код и профиль.
+fn pending_phone(dir: &Path, relay: &str, name: &str) -> (User, String) {
+    let phone = User::new(dir, name, relay);
+    let out = phone.run(&["link", "--name", name]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (phone, code)
+}
+
+/// Менять список устройств можно только через релей, а отключать — осознанно:
+/// без релея, без подтверждения и самого себя нельзя; локальный список при этом
+/// не меняется.
+#[test]
+fn list_changes_need_relay_and_confirmation() {
+    let dir = tmp_dir("devices-guards");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    bob.ok(&["set-username", "bobby"]);
+    let (phone, code) = pending_phone(&dir, &relay, "phone");
+    let response = dir.join("r.json");
+    bob.ok(&[
+        "link-approve",
+        &code,
+        "--yes",
+        "-o",
+        response.to_str().unwrap(),
+    ]);
+    phone.ok(&["link-finish", "--response-file", response.to_str().unwrap()]);
+    let before = bob.ok(&["devices"]);
+    assert!(before.contains("phone"), "{before}");
+
+    // Нельзя отключить само это устройство; №1 — тоже.
+    let out = bob.run(&["unlink", "1", "--yes"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("нельзя отключить это устройство"),
+        "{}",
+        stderr(&out)
+    );
+
+    // Без --yes и без терминала — отказ, список прежний.
+    let out = bob.run(&["unlink", "2"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--yes"), "{}", stderr(&out));
+    assert_eq!(bob.ok(&["devices"]), before);
+
+    // Релей недоступен: понятная ошибка, список прежний.
+    let offline = User {
+        db: bob.db.clone(),
+        relay: "ws://127.0.0.1:1/ws".into(),
+    };
+    let out = offline.run(&["unlink", "2", "--yes"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("релей недоступен"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(bob.ok(&["devices"]), before);
+
+    let (phone2, code2) = pending_phone(&dir, &relay, "phone2");
+    let _ = phone2;
+    let out = offline.run(&["link-approve", &code2, "--yes"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("релей недоступен"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(bob.ok(&["devices"]), before);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1046,4 +1122,563 @@ fn legacy_uuid_account_still_loads() {
         // Второй запуск (список устройств уже сохранён) тоже проходит.
         user.ok(&["whoami"]);
     }
+}
+
+/// Незавершённый link не даёт создать в профиле новую личность; профиль не меняется.
+#[test]
+fn init_is_refused_while_link_is_pending() {
+    let dir = tmp_dir("init-pending-link");
+    let relay = start_relay();
+    let (phone, code) = pending_phone(&dir, &relay, "phone");
+    let out = phone.run(&["init"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("link-finish"), "{}", stderr(&out));
+    {
+        let db = storage::Db::open(&phone.db, Some(TEST_PASSWORD)).unwrap();
+        assert!(db.get_local_identity().unwrap().is_none());
+        assert!(db.pending_link().unwrap().is_some());
+    }
+    // Тот же код подключения по-прежнему выдаётся.
+    let again = phone.ok(&["link", "--name", "phone"]);
+    assert_eq!(again.trim(), code);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Незавершённое восстановление ключа блокирует init, link и обычные команды.
+#[test]
+fn pending_restore_blocks_init_link_and_commands() {
+    let dir = tmp_dir("pending-restore");
+    let relay = start_relay();
+    let user = User::new(&dir, "restoring", &relay);
+    {
+        let db = storage::Db::open(&user.db, Some(TEST_PASSWORD)).unwrap();
+        db.set_pending_restore(&storage::PendingRestore {
+            account_id: "acc".into(),
+            account_secret: [1; 32],
+            x_secret: [2; 32],
+            sign_secret: [3; 32],
+            name: "phone".into(),
+        })
+        .unwrap();
+    }
+    for args in [&["init"][..], &["link", "--name", "phone"], &["whoami"]] {
+        let out = user.run(args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            stderr(&out).contains("restore-key"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+    let db = storage::Db::open(&user.db, Some(TEST_PASSWORD)).unwrap();
+    assert!(db.pending_restore().unwrap().is_some());
+    assert!(db.get_local_identity().unwrap().is_none());
+    assert!(db.pending_link().unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// restore-key
+// ---------------------------------------------------------------------------
+
+/// Резервная копия ключа аккаунта в `file`; возвращает код восстановления.
+fn make_backup(user: &User, file: &Path) -> String {
+    let run = backup_key_confirm(user, file, &[], last_group);
+    assert!(run.success, "{}", run.stderr);
+    backup_code(&run.stdout)
+}
+
+/// `restore-key` с кодом из окружения.
+fn restore(user: &User, file: &Path, code: &str, extra: &[&str]) -> Output {
+    let mut args = vec!["restore-key", "--file", file.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    user.cmd(&args)
+        .env("MESSENGER_BACKUP_CODE", code)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn restore_ok(user: &User, file: &Path, code: &str, name: &str) -> String {
+    let out = restore(user, file, code, &["--name", name]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Номер из фразы «устройство №N».
+fn device_number(text: &str) -> u32 {
+    let at = text.find("устройство №").expect("номер в выводе");
+    text[at..]
+        .chars()
+        .skip("устройство №".chars().count())
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap()
+}
+
+/// Запустить `listen` и ждать в его stderr строку с `needle` (до 10 секунд).
+fn listen_stderr_until(user: &User, needle: &str) -> String {
+    let mut child = user
+        .cmd(&["listen"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    let err = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let found = loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(line) if line.contains(needle) => break Some(line),
+            Ok(_) => {}
+            Err(_) => break None,
+        }
+    };
+    child.kill().unwrap();
+    let _ = child.wait();
+    found.unwrap_or_else(|| panic!("в stderr listen не появилось {needle:?}"))
+}
+
+fn befriend(a: &User, b: &User) {
+    a.ok(&["add-contact", "--contact", &b.ok(&["export-contact"])]);
+    b.ok(&["add-contact", "--contact", &a.ok(&["export-contact"])]);
+}
+
+/// Полный путь: Боб теряет доступ к ключу, восстанавливает его на новом устройстве,
+/// и оно работает наравне с первым.
+#[test]
+fn restore_key_gives_a_working_device() {
+    let dir = tmp_dir("restore-full");
+    let relay = start_relay();
+    let alice = User::new(&dir, "alice", &relay);
+    let bob = User::new(&dir, "bob", &relay);
+    let bob2 = User::new(&dir, "bob2", &relay);
+    for (u, name) in [(&alice, "alice"), (&bob, "bobby")] {
+        u.ok(&["init"]);
+        u.ok(&["set-username", name]);
+    }
+    befriend(&alice, &bob);
+    // Релей узнаёт аккаунт и его список устройств при первом выходе в сеть.
+    bob.ok(&["sync"]);
+    let file = dir.join("key.backup");
+    let code = make_backup(&bob, &file);
+
+    let out = restore(&bob2, &file, &code, &["--name", "ноутбук"]);
+    let (so, se) = (String::from_utf8_lossy(&out.stdout), stderr(&out));
+    assert!(out.status.success(), "{se}");
+    assert_eq!(device_number(&so), 2, "{so}");
+    assert!(so.contains("ключ аккаунта восстановлен"), "{so}");
+    assert!(so.contains("ноутбук"), "{so}");
+    assert!(!so.contains(&code) && !se.contains(&code));
+    assert!(!se.contains('!'), "{se}");
+    let who = bob2.ok(&["whoami"]);
+    assert_eq!(
+        field(&who, "account_id:"),
+        field(&bob.ok(&["whoami"]), "account_id:")
+    );
+
+    // №1 принимает новый список и предупреждает, что его изменили не здесь.
+    let warned = listen_stderr_until(&bob, "изменён на другом устройстве с ключом аккаунта");
+    assert!(warned.contains("v1→v2"), "{warned}");
+    assert!(bob.ok(&["devices"]).contains("ноутбук"));
+
+    // Алиса пишет — получают оба устройства (№2 сначала узнаёт Алису).
+    bob2.ok(&["add-contact", "--contact", &alice.ok(&["export-contact"])]);
+    let sent = alice.ok(&["send", "@bobby", "обоим", "--wait", "0"]);
+    assert!(sent.contains("(устройств: 2)"), "{sent}");
+    for u in [&bob, &bob2] {
+        u.ok(&["sync"]);
+        assert!(u.ok(&["chat", "@alice"]).contains("@alice: обоим"));
+    }
+
+    // №2 отвечает; Алиса получает, №1 видит отправленное с другого устройства.
+    bob2.ok(&["send", "@alice", "пишу с ноутбука", "--wait", "0"]);
+    alice.ok(&["sync"]);
+    assert!(
+        alice
+            .ok(&["chat", "@bobby"])
+            .contains("@bobby: пишу с ноутбука")
+    );
+    bob.ok(&["sync"]);
+    assert!(bob.ok(&["chat", "@alice"]).contains("пишу с ноутбука"));
+
+    // №2 подключает третье устройство, и оно доходит до конца.
+    let (phone, link_code) = pending_phone(&dir, &relay, "телефон");
+    let response = dir.join("resp.json");
+    bob2.ok(&[
+        "link-approve",
+        &link_code,
+        "--yes",
+        "-o",
+        response.to_str().unwrap(),
+    ]);
+    let finished = phone.ok(&["link-finish", "--response-file", response.to_str().unwrap()]);
+    assert_eq!(device_number(&finished), 3, "{finished}");
+
+    // Резервную копию можно сделать и на восстановленном устройстве.
+    let file2 = dir.join("key2.backup");
+    let code2 = make_backup(&bob2, &file2);
+    let opened = open_backup(&file2, &code2).unwrap();
+    assert_eq!(opened.account_id(), field(&who, "account_id:"));
+
+    // Карточка №2 принимается контактом.
+    let card = bob2.ok(&["export-contact"]);
+    alice.ok(&["add-contact", "--contact", &card]);
+
+    // №1 отключает №2 (с релеем и подтверждением): №2 больше не пускают.
+    bob.ok(&["sync"]);
+    assert!(bob.ok(&["unlink", "2", "--yes"]).contains("отключено"));
+    let out = bob2.run(&["sync"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("not in the account's device list"),
+        "{}",
+        stderr(&out)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Номер отключённого устройства не выдаётся и при восстановлении; два
+/// восстановления из одного файла дают разные номера.
+#[test]
+fn restore_key_numbers_are_not_reused() {
+    let dir = tmp_dir("restore-numbers");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    let (phone, code) = pending_phone(&dir, &relay, "phone");
+    let response = dir.join("r.json");
+    bob.ok(&[
+        "link-approve",
+        &code,
+        "--yes",
+        "-o",
+        response.to_str().unwrap(),
+    ]);
+    let n1 =
+        device_number(&phone.ok(&["link-finish", "--response-file", response.to_str().unwrap()]));
+    bob.ok(&["unlink", &n1.to_string(), "--yes"]);
+
+    let file = dir.join("key.backup");
+    let backup = make_backup(&bob, &file);
+    let (a, b) = (User::new(&dir, "ra", &relay), User::new(&dir, "rb", &relay));
+    let na = device_number(&restore_ok(&a, &file, &backup, "a"));
+    let nb = device_number(&restore_ok(&b, &file, &backup, "b"));
+    assert!(na > n1 && nb > na, "{n1} {na} {nb}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Неверный код, битый файл, слишком большой файл: ошибка, база не создаётся.
+#[test]
+fn restore_key_bad_input_creates_no_database() {
+    let dir = tmp_dir("restore-bad");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    let file = dir.join("key.backup");
+    let code = make_backup(&bob, &file);
+
+    let fresh = User::new(&dir, "fresh", &relay);
+    let wrong = crypto_core::backup::BackupCode::generate()
+        .display_grouped()
+        .to_string();
+    let out = restore(&fresh, &file, &wrong, &[]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("неверный код"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains(&wrong));
+    assert!(!fresh.db.exists());
+
+    let out = restore(&fresh, &file, "not a code!", &[]);
+    assert!(!out.status.success());
+    assert!(!fresh.db.exists());
+
+    let text = std::fs::read_to_string(&file).unwrap();
+    let broken = dir.join("broken.backup");
+    std::fs::write(&broken, &text[..text.len() / 2]).unwrap();
+    assert!(!restore(&fresh, &broken, &code, &[]).status.success());
+    std::fs::write(&broken, "это не копия").unwrap();
+    assert!(!restore(&fresh, &broken, &code, &[]).status.success());
+    std::fs::write(&broken, vec![b'x'; 10_000]).unwrap();
+    let out = restore(&fresh, &broken, &code, &[]);
+    assert!(stderr(&out).contains("слишком велик"), "{}", stderr(&out));
+    assert!(
+        !restore(&fresh, &dir.join("nope"), &code, &[])
+            .status
+            .success()
+    );
+    assert!(!fresh.db.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Профиль с личностью и профиль без пароля не годятся; чужое недоделанное
+/// восстановление не затирается.
+#[test]
+fn restore_key_refuses_unsuitable_profiles() {
+    let dir = tmp_dir("restore-profiles");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    let file = dir.join("key.backup");
+    let code = make_backup(&bob, &file);
+
+    let out = restore(&bob, &file, &code, &[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("уже есть личность"),
+        "{}",
+        stderr(&out)
+    );
+
+    let plain = User::new(&dir, "plain", &relay);
+    with_passwords(&plain, &["init", "--no-password"], None, None);
+    let out = restore(&plain, &file, &code, &[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("только в базу с паролем"),
+        "{}",
+        stderr(&out)
+    );
+
+    let other = User::new(&dir, "other", &relay);
+    {
+        let db = storage::Db::open(&other.db, Some(TEST_PASSWORD)).unwrap();
+        db.set_pending_restore(&storage::PendingRestore {
+            account_id: "someone-else".into(),
+            account_secret: [1; 32],
+            x_secret: [2; 32],
+            sign_secret: [3; 32],
+            name: "x".into(),
+        })
+        .unwrap();
+    }
+    let out = restore(&other, &file, &code, &[]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("новый профиль"), "{}", stderr(&out));
+    let db = storage::Db::open(&other.db, Some(TEST_PASSWORD)).unwrap();
+    assert_eq!(
+        db.pending_restore().unwrap().unwrap().account_id,
+        "someone-else"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Релей без списка устройств аккаунта: отказ, ничего не остаётся в профиле.
+#[test]
+fn restore_key_on_a_relay_that_does_not_know_the_account_is_refused() {
+    let dir = tmp_dir("restore-unknown");
+    let relay = start_relay();
+    let other_relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    let file = dir.join("key.backup");
+    let code = make_backup(&bob, &file);
+
+    let fresh = User::new(&dir, "fresh", &other_relay);
+    let out = restore(&fresh, &file, &code, &[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("не знает этот аккаунт"),
+        "{}",
+        stderr(&out)
+    );
+    let db = storage::Db::open(&fresh.db, Some(TEST_PASSWORD)).unwrap();
+    assert!(db.pending_restore().unwrap().is_none());
+    assert!(db.get_local_identity().unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Повтор после сбоя: запись о восстановлении осталась. Если ключи уже
+/// опубликованы («ответ не дошёл»), второй записи в списке нет; если нет — устройство
+/// добавляется с сохранёнными ключами.
+#[test]
+fn restore_key_resumes_after_a_failure() {
+    let dir = tmp_dir("restore-resume");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    bob.ok(&["sync"]);
+    let file = dir.join("key.backup");
+    let code = make_backup(&bob, &file);
+    let secret = open_backup(&file, &code).unwrap().account_sign().to_bytes();
+    let account_id = field(&bob.ok(&["whoami"]), "account_id:");
+    let pending_for = |x: [u8; 32], sign: [u8; 32]| storage::PendingRestore {
+        account_id: account_id.clone(),
+        account_secret: secret,
+        x_secret: x,
+        sign_secret: sign,
+        name: "прежнее".into(),
+    };
+
+    // Опубликовано, но профиль об этом не узнал: ключи берём у завершённого запуска.
+    let first = User::new(&dir, "first", &relay);
+    let n = device_number(&restore_ok(&first, &file, &code, "первое"));
+    let (x, sign) = {
+        let db = storage::Db::open(&first.db, Some(TEST_PASSWORD)).unwrap();
+        let row = db.get_local_identity().unwrap().unwrap();
+        (row.secret, row.sign_secret.unwrap())
+    };
+    let retry = User::new(&dir, "retry", &relay);
+    {
+        let db = storage::Db::open(&retry.db, Some(TEST_PASSWORD)).unwrap();
+        db.set_pending_restore(&pending_for(x, sign)).unwrap();
+    }
+    let again = restore_ok(&retry, &file, &code, "повтор");
+    assert_eq!(device_number(&again), n, "{again}");
+    {
+        let db = storage::Db::open(&retry.db, Some(TEST_PASSWORD)).unwrap();
+        assert!(db.pending_restore().unwrap().is_none());
+        let row = db.get_local_identity().unwrap().unwrap();
+        assert_eq!((row.device_id, row.secret), (n, x));
+    }
+    listen_stderr_until(&bob, "изменён на другом устройстве");
+    let list = bob.ok(&["devices"]);
+    assert_eq!(list.matches("№").count(), 2, "{list}");
+    assert!(list.contains("версия списка 2"), "{list}");
+
+    // Не опубликовано: берутся сохранённые ключи, устройство добавляется один раз.
+    let (x2, sign2) = ([5; 32], [6; 32]);
+    let late = User::new(&dir, "late", &relay);
+    {
+        let db = storage::Db::open(&late.db, Some(TEST_PASSWORD)).unwrap();
+        db.set_pending_restore(&pending_for(x2, sign2)).unwrap();
+    }
+    let n2 = device_number(&restore_ok(&late, &file, &code, "позднее"));
+    assert!(n2 > n);
+    let db = storage::Db::open(&late.db, Some(TEST_PASSWORD)).unwrap();
+    let row = db.get_local_identity().unwrap().unwrap();
+    assert_eq!(
+        (row.device_id, row.secret, row.sign_secret),
+        (n2, x2, Some(sign2))
+    );
+    assert!(db.pending_restore().unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Повтор при недоступном релее не стирает запись: ключи уже могли быть опубликованы.
+#[test]
+fn restore_key_retry_keeps_the_record_when_the_relay_is_down() {
+    let dir = tmp_dir("restore-down");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    bob.ok(&["sync"]);
+    let file = dir.join("key.backup");
+    let code = make_backup(&bob, &file);
+    let secret = open_backup(&file, &code).unwrap().account_sign().to_bytes();
+    let account_id = field(&bob.ok(&["whoami"]), "account_id:");
+
+    let first = User::new(&dir, "first", &relay);
+    let n = device_number(&restore_ok(&first, &file, &code, "первое"));
+    let (x, sign) = {
+        let db = storage::Db::open(&first.db, Some(TEST_PASSWORD)).unwrap();
+        let row = db.get_local_identity().unwrap().unwrap();
+        (row.secret, row.sign_secret.unwrap())
+    };
+    let pending = storage::PendingRestore {
+        account_id,
+        account_secret: secret,
+        x_secret: x,
+        sign_secret: sign,
+        name: "прежнее".into(),
+    };
+    let db_path = dir.join("retry.sqlite");
+    {
+        let db = storage::Db::open(&db_path, Some(TEST_PASSWORD)).unwrap();
+        db.set_pending_restore(&pending).unwrap();
+    }
+
+    let down = User::new(&dir, "retry", "ws://127.0.0.1:1");
+    let out = restore(&down, &file, &code, &["--name", "повтор"]);
+    assert!(!out.status.success());
+    {
+        let db = storage::Db::open(&db_path, Some(TEST_PASSWORD)).unwrap();
+        assert!(db.pending_restore().unwrap().is_some());
+        assert!(db.get_local_identity().unwrap().is_none());
+    }
+
+    let up = User::new(&dir, "retry", &relay);
+    let again = restore_ok(&up, &file, &code, "повтор");
+    assert_eq!(device_number(&again), n, "{again}");
+    listen_stderr_until(&bob, "изменён на другом устройстве");
+    let list = bob.ok(&["devices"]);
+    assert_eq!(list.matches("№").count(), 2, "{list}");
+    let db = storage::Db::open(&db_path, Some(TEST_PASSWORD)).unwrap();
+    assert!(db.pending_restore().unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Повтор `link-approve` с тем же кодом (ответ потерялся): ничего не публикуется,
+/// ответ выдаётся заново и подходит для `link-finish`. Код, у которого занят лишь
+/// один из двух ключей, отклоняется.
+#[test]
+fn link_approve_repeat_reissues_response() {
+    use base64::Engine;
+    let dir = tmp_dir("link-repeat");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    bob.ok(&["set-username", "bobby"]);
+    let (phone, code) = pending_phone(&dir, &relay, "phone");
+
+    let first = dir.join("first.json");
+    bob.ok(&[
+        "link-approve",
+        &code,
+        "--yes",
+        "-o",
+        first.to_str().unwrap(),
+    ]);
+    let devices_before = bob.ok(&["devices"]);
+
+    // Ответ «потерялся»: повторяем с тем же кодом.
+    let second = dir.join("second.json");
+    let out = bob.run(&[
+        "link-approve",
+        &code,
+        "--yes",
+        "-o",
+        second.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("ответ выдан повторно"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(bob.ok(&["devices"]), devices_before);
+    // Список не менялся (та же версия), поэтому ответ тот же.
+    assert_eq!(
+        std::fs::read_to_string(&first).unwrap(),
+        std::fs::read_to_string(&second).unwrap()
+    );
+
+    // Именно второй ответ завершает подключение.
+    let finished = phone.ok(&["link-finish", "--response-file", second.to_str().unwrap()]);
+    assert!(finished.contains("устройство №2"), "{finished}");
+
+    // Ключи совпадают лишь частично: x25519 от телефона, ed25519 от другого устройства.
+    let (_other, code2) = pending_phone(&dir, &relay, "phone2");
+    let decode = |c: &str| -> serde_json::Value {
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(c.strip_prefix("mlink1.").unwrap())
+            .unwrap();
+        serde_json::from_slice(&raw).unwrap()
+    };
+    let (mut mixed, other) = (decode(&code), decode(&code2));
+    mixed["ed25519_pub_b64"] = other["ed25519_pub_b64"].clone();
+    let mixed_code = format!(
+        "mlink1.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mixed.to_string())
+    );
+    let out = bob.run(&["link-approve", &mixed_code, "--yes"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("уже подключено"), "{}", stderr(&out));
+    assert_eq!(bob.ok(&["devices"]), devices_before);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

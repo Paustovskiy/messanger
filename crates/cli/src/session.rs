@@ -3,22 +3,40 @@
 //! Любое подключение к релею сразу получает накопившуюся очередь, поэтому
 //! входящие сообщения обрабатываются в любой команде (`send`, `sync`,
 //! `listen`), а не только в `listen`. Там же, при каждом подключении, клиент
-//! следит за запасом своих предключей на релее, а основное устройство — ещё
-//! и за тем, чтобы на релее лежал актуальный список устройств аккаунта.
+//! следит за запасом своих предключей на релее, а устройство с ключом
+//! аккаунта — ещё и за тем, чтобы на релее лежал актуальный список устройств.
 
 use crate::devices;
 use crate::display;
 use crate::messaging::{self, DeviceKey, Incoming};
 use crate::relay_client::RelayConn;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use crypto_core::{Bundle, Identity};
 use protocol::{
     ClientMessage, EnvelopeB64, OneTimePrekey, PRIMARY_DEVICE, ServerMessage, SignedDeviceListB64,
     SignedPrekey,
 };
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use storage::{Db, Direction, OutboxItem};
+
+/// Сколько ждать ответа релея на публикацию списка устройств.
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
+
+const SAME_VERSION_WARNING: &str = "! на релее список устройств той же версии v{v}, но с другим \
+     содержимым: проверьте `messenger devices`";
+
+/// Сохранённый список той же версии, что пришёл с релея, но другой по содержимому.
+fn same_version_other_content(
+    stored: Option<(u64, &SignedDeviceListB64)>,
+    wire: &SignedDeviceListB64,
+) -> bool {
+    stored.is_some_and(|(version, mine)| version == wire.version && mine != wire)
+}
+
+/// Текст ошибки, когда ответ на публикацию списка не пришёл: релей мог его принять.
+pub const PUBLISH_UNKNOWN: &str =
+    "неизвестно, принял ли релей список; проверьте `messenger devices` после sync";
 
 pub enum Step {
     Handled,
@@ -59,6 +77,10 @@ pub struct Session<'a> {
     sent_to: HashMap<String, (String, u32)>,
     parked: Vec<Parked>,
     list_checked: bool,
+    /// Список, который мы публикуем и ответа на который ждём (см. `publish_own`).
+    publishing: Option<SignedDeviceListB64>,
+    /// Итог последней публикации: `Err` — релей отклонил список.
+    list_publish: Option<Result<(), String>>,
 }
 
 impl<'a> Session<'a> {
@@ -79,6 +101,8 @@ impl<'a> Session<'a> {
             sent_to: HashMap::new(),
             parked: Vec::new(),
             list_checked: false,
+            publishing: None,
+            list_publish: None,
         })
     }
 
@@ -122,6 +146,46 @@ impl<'a> Session<'a> {
         self.conn
             .send(&ClientMessage::PublishDeviceList { list })
             .await
+    }
+
+    /// Опубликовать свой список и дождаться ответа релея. Успех — релей прислал
+    /// ровно этот список (`on_device_list` при этом сам его сохранит); ошибка —
+    /// релей отклонил список (в том числе как устаревший) или не ответил.
+    pub async fn publish_own(&mut self, wire: SignedDeviceListB64) -> Result<()> {
+        self.list_publish = None;
+        self.publishing = Some(wire.clone());
+        let result = self.wait_publish(wire).await;
+        self.publishing = None;
+        result
+    }
+
+    async fn wait_publish(&mut self, wire: SignedDeviceListB64) -> Result<()> {
+        // Отправка могла дойти до релея целиком или частично: при любой ошибке
+        // после этого результат неизвестен, а не «список не принят».
+        self.publish_device_list(wire)
+            .await
+            .map_err(|e| e.context(PUBLISH_UNKNOWN))?;
+        let deadline = Instant::now() + PUBLISH_TIMEOUT;
+        loop {
+            match self.list_publish.take() {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(m)) => bail!("{m}"),
+                None => {}
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("{PUBLISH_UNKNOWN}");
+            }
+            let step = self
+                .step(Some(left))
+                .await
+                .map_err(|e| e.context(PUBLISH_UNKNOWN))?;
+            match step {
+                Step::Handled => {}
+                Step::Timeout => bail!("{PUBLISH_UNKNOWN}"),
+                Step::Closed => bail!("релей закрыл соединение; {PUBLISH_UNKNOWN}"),
+            }
+        }
     }
 
     /// Обработать следующее событие от релея (ждать не дольше `wait`, если задано).
@@ -216,7 +280,11 @@ impl<'a> Session<'a> {
             }
             ServerMessage::DeviceList { account_id, list } => {
                 if let Some(wire) = list.filter(|l| l.account_id == account_id) {
-                    self.on_device_list(&wire);
+                    let ours = self.publishing.as_ref() == Some(&wire);
+                    self.on_device_list(&wire, ours);
+                    if ours {
+                        self.list_publish = Some(Ok(()));
+                    }
                 }
                 self.device_lists.insert(account_id.clone());
                 // Конверты, ждавшие этого списка, — ещё раз.
@@ -248,7 +316,17 @@ impl<'a> Session<'a> {
             } => {
                 if message.contains("removed from the account") {
                     self.removed = true;
-                    eprintln!("! это устройство отключено от аккаунта на основном устройстве");
+                    eprintln!("! это устройство отключено от аккаунта");
+                } else if self.publishing.is_some() {
+                    // Ответ на нашу публикацию списка: его разберёт `publish_own`.
+                    let text = if message.contains("only the primary") {
+                        "релей старой версии: обновите релей".to_owned()
+                    } else {
+                        message
+                    };
+                    self.list_publish = Some(Err(text));
+                } else if message.contains("only the primary") {
+                    eprintln!("ошибка релея: релей старой версии: обновите релей");
                 } else {
                     eprintln!("ошибка релея: {message}");
                 }
@@ -260,43 +338,79 @@ impl<'a> Session<'a> {
 
     /// Свой список устройств на релее должен быть актуальным: его по нему
     /// пускают остальные устройства, а собеседники узнают, кому писать.
+    /// Устройство с ключом аккаунта публикует свой список, если на релее старее
+    /// или пусто, а если там новее (другое устройство с ключом изменило список) —
+    /// забирает его. Публикаций «по кругу» нет: публикует только тот, у кого
+    /// версия больше, а получивший новый список своей версии уже не повышает.
     async fn check_own_list(&mut self, relay_version: Option<u64>) -> Result<()> {
-        if self.me.device_id() == PRIMARY_DEVICE {
-            let (local, wire) = devices::own_list(self.db, self.me)?;
-            match relay_version {
-                Some(v) if v == local.version => {}
-                Some(v) if v > local.version => eprintln!(
-                    "! на релее список устройств новее (v{v}), чем на этом устройстве (v{}). \
-                     Если это не вы меняли список — кто-то владеет ключом аккаунта.",
-                    local.version
-                ),
-                _ => self.publish_device_list(wire).await?,
-            }
+        let me = self.me.account_id().to_owned();
+        let stored = if self.me.device_id() == PRIMARY_DEVICE && self.me.has_account_key() {
+            Some(devices::own_list(self.db, self.me)?)
         } else {
-            let local = devices::stored(self.db, self.me.account_id())?.map(|(l, _)| l.version);
-            if relay_version > local {
-                let me = self.me.account_id().to_owned();
+            devices::stored(self.db, &me)?
+        };
+        let local = stored.as_ref().map(|(l, _)| l.version);
+        match (stored, relay_version) {
+            (_, None) if local.is_none() => {}
+            (Some((_, wire)), None) if self.me.has_account_key() => {
+                self.publish_device_list(wire).await?;
+            }
+            (Some((l, wire)), Some(v)) if self.me.has_account_key() && v < l.version => {
+                self.publish_device_list(wire).await?;
+            }
+            (_, Some(v)) if Some(v) > local => self.fetch_device_list(&me).await?,
+            // Та же версия: у держателя ключа сверяем содержимое (см. `on_device_list`).
+            (_, Some(v)) if Some(v) == local && self.me.has_account_key() => {
                 self.fetch_device_list(&me).await?;
             }
+            _ => {}
         }
         Ok(())
     }
 
-    fn on_device_list(&mut self, wire: &SignedDeviceListB64) {
+    fn on_device_list(&mut self, wire: &SignedDeviceListB64, ours: bool) {
         let account = wire.account_id.clone();
+        let before_full = if account == self.me.account_id() {
+            devices::stored(self.db, &account).ok().flatten()
+        } else {
+            None
+        };
+        let before = before_full.as_ref().map(|(l, _)| l.version);
         match devices::accept(self.db, self.me, wire) {
             Ok(Some(list)) if account == self.me.account_id() => {
+                if let (Some(old), true) = (before, self.me.has_account_key() && !ours) {
+                    eprintln!(
+                        "! список устройств изменён на другом устройстве с ключом аккаунта \
+                         (v{old}→v{}); если это не вы — ключ аккаунта у постороннего",
+                        list.version
+                    );
+                }
                 let still_here = list.device(self.me.device_id()).is_some_and(|d| {
                     d.ed25519_pub == self.me.sign_public_bytes()
                         && d.x25519_pub == self.me.x_public_bytes()
                 });
                 if !still_here {
                     self.removed = true;
-                    eprintln!("! это устройство отключено от аккаунта на основном устройстве");
+                    eprintln!("! это устройство отключено от аккаунта");
                 }
             }
             Ok(_) => {}
-            Err(e) => eprintln!("! список устройств {account} отклонён: {e:#}"),
+            Err(e) => {
+                let mine = self.me.has_account_key() && account == self.me.account_id();
+                if mine
+                    && same_version_other_content(
+                        before_full.as_ref().map(|(l, w)| (l.version, w)),
+                        wire,
+                    )
+                {
+                    eprintln!(
+                        "{}",
+                        SAME_VERSION_WARNING.replace("{v}", &wire.version.to_string())
+                    );
+                } else {
+                    eprintln!("! список устройств {account} отклонён: {e:#}");
+                }
+            }
         }
     }
 
@@ -392,5 +506,29 @@ impl<'a> Session<'a> {
 
     pub async fn close(self) {
         self.conn.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire(version: u64, sig: &str) -> SignedDeviceListB64 {
+        SignedDeviceListB64 {
+            account_id: "a".into(),
+            account_pub_b64: String::new(),
+            version,
+            devices: Vec::new(),
+            sig_b64: sig.into(),
+        }
+    }
+
+    #[test]
+    fn same_version_other_content_is_recognized() {
+        let mine = wire(3, "x");
+        assert!(same_version_other_content(Some((3, &mine)), &wire(3, "y")));
+        assert!(!same_version_other_content(Some((3, &mine)), &wire(3, "x")));
+        assert!(!same_version_other_content(Some((3, &mine)), &wire(2, "y")));
+        assert!(!same_version_other_content(None, &wire(3, "y")));
     }
 }

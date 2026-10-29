@@ -32,8 +32,9 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
-    ClientMessage, DeviceList, Envelope, OneTimePrekey, OneTimePrekeyB64, PRIMARY_DEVICE,
-    ServerMessage, SignedDeviceListB64, SignedPrekey, SignedPrekeyB64, b64, check_id, decode_fixed,
+    ACCOUNT_SESSION_DEVICE, ClientMessage, DeviceList, Envelope, OneTimePrekey, OneTimePrekeyB64,
+    PRIMARY_DEVICE, ServerMessage, SignedDeviceListB64, SignedPrekey, SignedPrekeyB64, b64,
+    check_id, decode_fixed,
 };
 use ratelimit::{Rate, RateLimiter};
 use std::future::Future;
@@ -178,6 +179,8 @@ struct Inner {
     /// (например, `listen` и `send` в соседних терминалах) — шлём всем.
     online: DashMap<DeviceKey, Vec<Client>>,
     next_conn_id: AtomicU64,
+    /// Открытые сессии ключом аккаунта: account_id → сколько их сейчас.
+    account_sessions: DashMap<String, usize>,
     limiters: Limiters,
 }
 
@@ -193,6 +196,7 @@ impl Relay {
             store,
             online: DashMap::new(),
             next_conn_id: AtomicU64::new(1),
+            account_sessions: DashMap::new(),
             limiters,
         })))
     }
@@ -264,6 +268,46 @@ impl Relay {
         Ok(self
             .device_list(account_id)?
             .is_some_and(|(l, _)| l.device(device_id).is_some()))
+    }
+}
+
+/// Место в лимите сессий аккаунта; освобождается при любом завершении соединения.
+struct SessionSlot {
+    relay: Relay,
+    account_id: String,
+}
+
+impl SessionSlot {
+    fn acquire(relay: &Relay, account_id: &str) -> Option<Self> {
+        let max = relay.0.config.limits.max_connections_per_account;
+        let mut n = relay
+            .0
+            .account_sessions
+            .entry(account_id.to_owned())
+            .or_insert(0);
+        if *n >= max {
+            drop(n);
+            relay
+                .0
+                .account_sessions
+                .remove_if(account_id, |_, n| *n == 0);
+            return None;
+        }
+        *n += 1;
+        Some(Self {
+            relay: relay.clone(),
+            account_id: account_id.to_owned(),
+        })
+    }
+}
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        let sessions = &self.relay.0.account_sessions;
+        if let Some(mut n) = sessions.get_mut(&self.account_id) {
+            *n = n.saturating_sub(1);
+        }
+        sessions.remove_if(&self.account_id, |_, n| *n == 0);
     }
 }
 
@@ -432,6 +476,29 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
         return;
     };
 
+    if my_device == ACCOUNT_SESSION_DEVICE {
+        let Some(_slot) = SessionSlot::acquire(&relay, &me) else {
+            warn!(account_id = %me, "too many simultaneous account key sessions");
+            let _ = tx.send(error(
+                "too many simultaneous connections for this account",
+                None,
+            ));
+            drop(tx);
+            let _ = writer.await;
+            return;
+        };
+        let _ = tx.send(to_json(&ServerMessage::Authenticated {
+            account_id: me.clone(),
+            device_id: my_device,
+        }));
+        info!(account_id = %me, "account key session");
+        account_session_loop(&relay, &me, &tx, &mut ws_rx, idle_timeout).await;
+        info!(account_id = %me, conn_id, "account key session closed");
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+        return;
+    }
+
     let my = (me.as_str(), my_device);
     let kick = Arc::new(Notify::new());
     {
@@ -526,7 +593,7 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
                 }
                 Ok(ClientMessage::PublishDeviceList { list }) => {
                     let reply = if relay.0.limiters.publishes.check(&me) {
-                        handle_publish_device_list(&relay, my, &my_sign_pub, list)
+                        handle_publish_device_list(&relay, my, list)
                     } else {
                         error(RATE_LIMITED, None)
                     };
@@ -562,6 +629,47 @@ async fn handle_socket(relay: Relay, socket: WebSocket) {
     let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
 }
 
+/// Сессия ключом аккаунта: только список устройств (чтение своего, публикация).
+/// Не онлайн-устройство: очередь, предключи и сообщения ей недоступны.
+async fn account_session_loop(
+    relay: &Relay,
+    me: &str,
+    tx: &mpsc::UnboundedSender<String>,
+    ws_rx: &mut futures_util::stream::SplitStream<WebSocket>,
+    idle_timeout: Duration,
+) {
+    const NOT_ALLOWED: &str = "not allowed in an account session";
+    let frames = RateLimiter::new(relay.0.config.limits.frames_per_connection);
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout(idle_timeout, ws_rx.next()).await {
+        if matches!(msg, Message::Text(_) | Message::Binary(_)) && !frames.check("") {
+            let _ = tx.send(error(RATE_LIMITED, None));
+            continue;
+        }
+        match msg {
+            Message::Text(text) => {
+                let reply = match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(ClientMessage::FetchDeviceList { account_id }) if account_id == me => {
+                        handle_fetch_device_list(relay, &account_id)
+                    }
+                    Ok(ClientMessage::PublishDeviceList { list }) => {
+                        if relay.0.limiters.publishes.check(me) {
+                            handle_publish_device_list(relay, (me, ACCOUNT_SESSION_DEVICE), list)
+                        } else {
+                            error(RATE_LIMITED, None)
+                        }
+                    }
+                    Ok(ClientMessage::Auth { .. }) => error("already authenticated", None),
+                    Ok(_) => error(NOT_ALLOWED, None),
+                    Err(_) => error("invalid json", None),
+                };
+                let _ = tx.send(reply);
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+}
+
 fn authenticate(
     relay: &Relay,
     nonce: &[u8; 32],
@@ -578,6 +686,22 @@ fn authenticate(
     if !crypto_core::verify_signature(&sign_pub, &data, &sig) {
         return Err("invalid auth signature".into());
     }
+    if device_id == ACCOUNT_SESSION_DEVICE {
+        // Сессия ключом аккаунта: ключ должен быть уже закреплён за аккаунтом.
+        // Привязку здесь не создаём.
+        if crypto_core::check_account_id(account_id, &sign_pub).is_err() {
+            return Err("account_id does not belong to this key".into());
+        }
+        return match relay.0.store.account_key(account_id) {
+            Ok(Some(k)) if k == sign_pub => Ok(sign_pub),
+            Ok(Some(_)) => Err("this account_id is bound to a different key".into()),
+            Ok(None) => Err("account key session needs a known account".into()),
+            Err(e) => {
+                warn!("store error during auth: {e:#}");
+                Err("internal error".into())
+            }
+        };
+    }
     if device_id != PRIMARY_DEVICE {
         // Дополнительное устройство: его ключ должен быть в подписанном списке.
         return match relay.device_list(account_id) {
@@ -588,7 +712,7 @@ fn authenticate(
             {
                 Ok(sign_pub)
             }
-            Ok(_) => Err("this device is not in the account's device list".into()),
+            Ok(_) => Err(protocol::ERR_NOT_IN_DEVICE_LIST.into()),
             Err(e) => {
                 warn!("store error during auth: {e:#}");
                 Err("internal error".into())
@@ -845,17 +969,18 @@ fn handle_fetch_bundle(relay: &Relay, me: &str, target: Device<'_>) -> String {
     }
 }
 
-fn handle_publish_device_list(
-    relay: &Relay,
-    me: Device<'_>,
-    my_sign_pub: &[u8; 32],
-    wire: SignedDeviceListB64,
-) -> String {
-    if me.1 != PRIMARY_DEVICE {
-        return error("only the primary device can change the device list", None);
-    }
-    // Ключ основного устройства и есть ключ аккаунта.
-    let list = match crypto_core::verify_device_list(&wire, me.0, Some(my_sign_pub)) {
+fn handle_publish_device_list(relay: &Relay, me: Device<'_>, wire: SignedDeviceListB64) -> String {
+    // Список подписан ключом аккаунта; публиковать может любое устройство
+    // аккаунта, у которого этот ключ есть.
+    let key = match relay.0.store.account_key(me.0) {
+        Ok(Some(k)) => k,
+        Ok(None) => return error("account has no bound key", None),
+        Err(e) => {
+            warn!("account key lookup failed: {e:#}");
+            return error("internal error", None);
+        }
+    };
+    let list = match crypto_core::verify_device_list(&wire, me.0, Some(&key)) {
         Ok(l) => l,
         Err(e) => return error(format!("bad device list: {e}"), None),
     };
@@ -868,13 +993,29 @@ fn handle_publish_device_list(
     };
     if let Some((old, old_wire)) = &old {
         if list.version < old.version || (list.version == old.version && *old_wire != wire) {
-            return error("stale device list version", None);
+            return error(protocol::ERR_STALE_DEVICE_LIST, None);
         }
     }
+    if let Err(e) = protocol::backup::check_list_update(old.as_ref().map(|(l, _)| l), &list) {
+        return error(format!("bad device list: {e}"), None);
+    }
+    // Тот же список повторно: ничего не меняем и никого не трогаем.
+    if old.as_ref().is_some_and(|(_, w)| *w == wire) {
+        return to_json(&ServerMessage::DeviceList {
+            account_id: me.0.to_owned(),
+            list: Some(wire),
+        });
+    }
     let json = serde_json::to_string(&wire).expect("serializable");
-    if let Err(e) = relay.0.store.save_device_list(me.0, list.version, &json) {
-        warn!("save device list failed: {e:#}");
-        return error("internal error", None);
+    match relay.0.store.save_device_list(me.0, list.version, &json) {
+        Ok(true) => {}
+        // Другой держатель ключа успел записать список этой версии между проверкой и
+        // записью: наш не сохранён, ни выгонять, ни рассылать по нему нельзя.
+        Ok(false) => return error(protocol::ERR_STALE_DEVICE_LIST, None),
+        Err(e) => {
+            warn!("save device list failed: {e:#}");
+            return error("internal error", None);
+        }
     }
 
     // Убранные устройства (или чей номер теперь с другими ключами): забыть их
