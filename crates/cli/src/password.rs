@@ -12,6 +12,9 @@ pub const ENV_PASSWORD: &str = "MESSENGER_PASSWORD";
 /// Новый пароль для `set-password`.
 pub const ENV_NEW_PASSWORD: &str = "MESSENGER_NEW_PASSWORD";
 
+/// Код восстановления ключа аккаунта для `restore-key`.
+pub const ENV_BACKUP_CODE: &str = "MESSENGER_BACKUP_CODE";
+
 const MIN_CHARS: usize = 8;
 
 /// Спросить существующий пароль.

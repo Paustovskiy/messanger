@@ -6,6 +6,7 @@ mod display;
 mod messaging;
 mod password;
 mod relay_client;
+mod restore;
 mod session;
 
 use anyhow::{Context, Result, bail};
@@ -199,6 +200,18 @@ enum Command {
         allow_redirect: bool,
     },
 
+    /// Восстановить ключ аккаунта из резервной копии в новом профиле: профиль
+    /// становится новым устройством аккаунта. Код копии спрашивается скрыто
+    /// (или берётся из MESSENGER_BACKUP_CODE).
+    RestoreKey {
+        /// Файл резервной копии (`backup-key`).
+        #[arg(long)]
+        file: PathBuf,
+        /// Как назвать устройство (видно в `messenger devices`).
+        #[arg(long, default_value = "восстановленное устройство")]
+        name: String,
+    },
+
     /// На устройстве с ключом аккаунта: отключить другое устройство от аккаунта.
     Unlink {
         /// Номер устройства (см. `messenger devices`).
@@ -237,6 +250,9 @@ fn run() -> Result<()> {
         Command::SetPassword => return cmd_set_password(&path),
         Command::RemovePassword => return cmd_remove_password(&path),
         Command::Link { name, no_password } => return cmd_link(&path, name, *no_password),
+        Command::RestoreKey { file, name } => {
+            return restore::cmd_restore_key(&path, file, name, &cli.relay);
+        }
         _ => {}
     }
 
@@ -245,7 +261,8 @@ fn run() -> Result<()> {
         Command::Init { .. }
         | Command::SetPassword
         | Command::RemovePassword
-        | Command::Link { .. } => unreachable!(),
+        | Command::Link { .. }
+        | Command::RestoreKey { .. } => unreachable!(),
         Command::Whoami => cmd_whoami(&db, &cli),
         Command::SetUsername { username } => cmd_set_username(&db, &username),
         Command::ExportContact { out } => cmd_export_contact(&db, out),
@@ -1067,8 +1084,8 @@ fn cmd_devices(db: &Db) -> Result<()> {
     Ok(())
 }
 
-/// Шаг 1 (новое устройство): завести ключи и выдать код подключения.
-fn cmd_link(path: &Path, name: &str, no_password: bool) -> Result<()> {
+/// Проверить название устройства; возвращает его без пробелов по краям.
+fn check_device_name(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty()
         || name.chars().count() > MAX_DEVICE_NAME
@@ -1076,6 +1093,12 @@ fn cmd_link(path: &Path, name: &str, no_password: bool) -> Result<()> {
     {
         bail!("название устройства — от 1 до {MAX_DEVICE_NAME} символов");
     }
+    Ok(name)
+}
+
+/// Шаг 1 (новое устройство): завести ключи и выдать код подключения.
+fn cmd_link(path: &Path, name: &str, no_password: bool) -> Result<()> {
+    let name = check_device_name(name)?;
     let db = match storage::file_state(path)? {
         FileState::Missing => {
             let pw = if no_password {
