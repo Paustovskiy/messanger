@@ -290,16 +290,22 @@ fn run() -> Result<()> {
 // Личность
 // ---------------------------------------------------------------------------
 
+const LINK_UNFINISHED: &str = "устройство ещё не подключено: разрешите подключение на основном \
+     устройстве (`messenger link-approve`) и завершите здесь (`messenger link-finish`)";
+
+const RESTORE_UNFINISHED: &str = "восстановление ключа не завершено — повторите \
+     `messenger restore-key …` в этом профиле";
+
 /// Загрузить свою личность (ключи этого устройства). Личность из старой
 /// версии без ключа подписи автоматически получает его, а основное
 /// устройство — список устройств аккаунта.
 fn load_identity(db: &Db) -> Result<(IdentityRow, Identity)> {
     let Some(mut row) = db.get_local_identity()? else {
+        if db.pending_restore()?.is_some() {
+            bail!("{RESTORE_UNFINISHED}");
+        }
         if db.pending_link()?.is_some() {
-            bail!(
-                "устройство ещё не подключено: разрешите подключение на основном устройстве \
-                 (`messenger link-approve`) и завершите здесь (`messenger link-finish`)"
-            );
+            bail!("{LINK_UNFINISHED}");
         }
         bail!("личность ещё не создана — сначала выполните `messenger init`");
     };
@@ -367,6 +373,20 @@ fn cmd_init(path: &Path, profile: &str, no_password: bool) -> Result<()> {
                 );
             }
             return Ok(());
+        }
+        if db.pending_restore()?.is_some() {
+            bail!(
+                "{RESTORE_UNFINISHED}. Новую личность в этом профиле создать нельзя — \
+                 иначе пропадут ключи, ожидающие завершения; либо используйте новый профиль \
+                 (`messenger --profile <имя> init`)"
+            );
+        }
+        if db.pending_link()?.is_some() {
+            bail!(
+                "{LINK_UNFINISHED}. Новую личность в этом профиле создать нельзя — \
+                 иначе пропадут ключи, ожидающие завершения; либо используйте новый профиль \
+                 (`messenger --profile <имя> init`)"
+            );
         }
         if state == FileState::Encrypted {
             // Зашифрованная база без личности: пароль уже введён, просто создаём.
@@ -1074,6 +1094,12 @@ fn cmd_link(path: &Path, name: &str, no_password: bool) -> Result<()> {
         bail!(
             "в этом профиле уже есть личность. Новое устройство подключают в новом, \
              пустом профиле: `messenger --profile <имя> link`"
+        );
+    }
+    if db.pending_restore()?.is_some() {
+        bail!(
+            "{RESTORE_UNFINISHED}. Подключать устройство в этом профиле нельзя — \
+             используйте новый профиль (`messenger --profile <имя> link`)"
         );
     }
     let link = match db.pending_link()? {

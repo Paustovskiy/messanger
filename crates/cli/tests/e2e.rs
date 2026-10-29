@@ -1122,3 +1122,56 @@ fn legacy_uuid_account_still_loads() {
         user.ok(&["whoami"]);
     }
 }
+
+/// Незавершённый link не даёт создать в профиле новую личность; профиль не меняется.
+#[test]
+fn init_is_refused_while_link_is_pending() {
+    let dir = tmp_dir("init-pending-link");
+    let relay = start_relay();
+    let (phone, code) = pending_phone(&dir, &relay, "phone");
+    let out = phone.run(&["init"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("link-finish"), "{}", stderr(&out));
+    {
+        let db = storage::Db::open(&phone.db, Some(TEST_PASSWORD)).unwrap();
+        assert!(db.get_local_identity().unwrap().is_none());
+        assert!(db.pending_link().unwrap().is_some());
+    }
+    // Тот же код подключения по-прежнему выдаётся.
+    let again = phone.ok(&["link", "--name", "phone"]);
+    assert_eq!(again.trim(), code);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Незавершённое восстановление ключа блокирует init, link и обычные команды.
+#[test]
+fn pending_restore_blocks_init_link_and_commands() {
+    let dir = tmp_dir("pending-restore");
+    let relay = start_relay();
+    let user = User::new(&dir, "restoring", &relay);
+    {
+        let db = storage::Db::open(&user.db, Some(TEST_PASSWORD)).unwrap();
+        db.set_pending_restore(&storage::PendingRestore {
+            account_id: "acc".into(),
+            account_secret: [1; 32],
+            x_secret: [2; 32],
+            sign_secret: [3; 32],
+            name: "phone".into(),
+        })
+        .unwrap();
+    }
+    for args in [&["init"][..], &["link", "--name", "phone"], &["whoami"]] {
+        let out = user.run(args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            stderr(&out).contains("restore-key"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+    let db = storage::Db::open(&user.db, Some(TEST_PASSWORD)).unwrap();
+    assert!(db.pending_restore().unwrap().is_some());
+    assert!(db.get_local_identity().unwrap().is_none());
+    assert!(db.pending_link().unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
