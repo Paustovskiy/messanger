@@ -1611,3 +1611,74 @@ fn restore_key_retry_keeps_the_record_when_the_relay_is_down() {
     assert!(db.pending_restore().unwrap().is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Повтор `link-approve` с тем же кодом (ответ потерялся): ничего не публикуется,
+/// ответ выдаётся заново и подходит для `link-finish`. Код, у которого занят лишь
+/// один из двух ключей, отклоняется.
+#[test]
+fn link_approve_repeat_reissues_response() {
+    use base64::Engine;
+    let dir = tmp_dir("link-repeat");
+    let relay = start_relay();
+    let bob = User::new(&dir, "bob", &relay);
+    bob.ok(&["init"]);
+    bob.ok(&["set-username", "bobby"]);
+    let (phone, code) = pending_phone(&dir, &relay, "phone");
+
+    let first = dir.join("first.json");
+    bob.ok(&[
+        "link-approve",
+        &code,
+        "--yes",
+        "-o",
+        first.to_str().unwrap(),
+    ]);
+    let devices_before = bob.ok(&["devices"]);
+
+    // Ответ «потерялся»: повторяем с тем же кодом.
+    let second = dir.join("second.json");
+    let out = bob.run(&[
+        "link-approve",
+        &code,
+        "--yes",
+        "-o",
+        second.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("ответ выдан повторно"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(bob.ok(&["devices"]), devices_before);
+    // Список не менялся (та же версия), поэтому ответ тот же.
+    assert_eq!(
+        std::fs::read_to_string(&first).unwrap(),
+        std::fs::read_to_string(&second).unwrap()
+    );
+
+    // Именно второй ответ завершает подключение.
+    let finished = phone.ok(&["link-finish", "--response-file", second.to_str().unwrap()]);
+    assert!(finished.contains("устройство №2"), "{finished}");
+
+    // Ключи совпадают лишь частично: x25519 от телефона, ed25519 от другого устройства.
+    let (_other, code2) = pending_phone(&dir, &relay, "phone2");
+    let decode = |c: &str| -> serde_json::Value {
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(c.strip_prefix("mlink1.").unwrap())
+            .unwrap();
+        serde_json::from_slice(&raw).unwrap()
+    };
+    let (mut mixed, other) = (decode(&code), decode(&code2));
+    mixed["ed25519_pub_b64"] = other["ed25519_pub_b64"].clone();
+    let mixed_code = format!(
+        "mlink1.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mixed.to_string())
+    );
+    let out = bob.run(&["link-approve", &mixed_code, "--yes"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("уже подключено"), "{}", stderr(&out));
+    assert_eq!(bob.ok(&["devices"]), devices_before);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

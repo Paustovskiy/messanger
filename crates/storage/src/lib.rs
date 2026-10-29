@@ -26,6 +26,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 pub mod encryption;
 pub use encryption::{FileState, PasswordRequired, WrongPassword, file_state, reencrypt};
@@ -56,6 +57,25 @@ pub struct IdentityRow {
     /// Секрет ключа аккаунта на устройстве не №1 (восстановление из резервной
     /// копии). У №1 — `None`: там ключ аккаунта это `sign_secret`.
     pub account_sign_secret: Option<[u8; 32]>,
+}
+
+impl IdentityRow {
+    /// Обнулить секретные поля.
+    pub fn zeroize_secrets(&mut self) {
+        self.secret.zeroize();
+        if let Some(k) = self.sign_secret.as_mut() {
+            k.zeroize();
+        }
+        if let Some(k) = self.account_sign_secret.as_mut() {
+            k.zeroize();
+        }
+    }
+}
+
+impl Drop for IdentityRow {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
 }
 
 impl std::fmt::Debug for IdentityRow {
@@ -211,6 +231,20 @@ pub struct PendingLink {
     pub name: String,
 }
 
+impl PendingLink {
+    /// Обнулить секретные поля.
+    pub fn zeroize_secrets(&mut self) {
+        self.x_secret.zeroize();
+        self.sign_secret.zeroize();
+    }
+}
+
+impl Drop for PendingLink {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
+}
+
 impl std::fmt::Debug for PendingLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingLink")
@@ -230,6 +264,21 @@ pub struct PendingRestore {
     pub x_secret: [u8; 32],
     pub sign_secret: [u8; 32],
     pub name: String,
+}
+
+impl PendingRestore {
+    /// Обнулить секретные поля.
+    pub fn zeroize_secrets(&mut self) {
+        self.account_secret.zeroize();
+        self.x_secret.zeroize();
+        self.sign_secret.zeroize();
+    }
+}
+
+impl Drop for PendingRestore {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
 }
 
 impl std::fmt::Debug for PendingRestore {
