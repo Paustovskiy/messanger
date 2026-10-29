@@ -1149,7 +1149,7 @@ fn cmd_link(path: &Path, name: &str, no_password: bool) -> Result<()> {
     eprintln!();
     eprintln!("Отпечаток этого устройства: {}", keys.fingerprint());
     eprintln!();
-    eprintln!("Дальше, на основном устройстве:");
+    eprintln!("Дальше, на устройстве с ключом аккаунта:");
     eprintln!("  messenger link-approve <код выше> -o link-response.json");
     eprintln!("Оно покажет отпечаток — он должен совпасть с этим.");
     eprintln!("Затем здесь: messenger link-finish --response-file link-response.json");
@@ -1421,7 +1421,7 @@ fn cmd_link_finish(db: &Db, response: Option<String>, file: Option<PathBuf>) -> 
         "отпечаток аккаунта: {}",
         devices::account_fingerprint(&list)
     );
-    println!("Сверьте его с `messenger whoami` на основном устройстве.");
+    println!("Сверьте его с `messenger whoami` на устройстве с ключом аккаунта.");
     println!("Перенесено контактов: {}.", payload.contacts.len());
     println!();
     println!("Дальше: `messenger listen` — устройство выйдет в сеть и опубликует свои предключи.");
