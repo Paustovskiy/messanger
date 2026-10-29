@@ -594,8 +594,8 @@ fn second_device_joins_receives_and_is_unlinked() {
     let sent = alice.ok(&["send", "@bobby", "только ноутбуку", "--wait", "0"]);
     assert!(sent.contains("отправлено: @bobby\n"), "{sent}");
 
-    // Подключать и отключать может только основное устройство.
-    assert!(stderr(&phone.run(&["unlink", "1"])).contains("основное"));
+    // Подключать и отключать может только устройство с ключом аккаунта.
+    assert!(stderr(&phone.run(&["unlink", "1"])).contains("ключом аккаунта"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -485,18 +485,28 @@ fn cmd_set_username(db: &Db, username: &str) -> Result<()> {
 
 fn cmd_export_contact(db: &Db, out: Option<PathBuf>) -> Result<()> {
     let (row, id) = load_identity(db)?;
-    if id.device_id() != PRIMARY_DEVICE {
+    if !id.has_account_key() {
         bail!(
-            "карточку подписывает ключ аккаунта, а он есть только на основном устройстве — \
-             выгрузите карточку там"
+            "карточку подписывает ключ аккаунта, а его на этом устройстве нет — \
+             выгрузите карточку на устройстве с ключом аккаунта"
         );
     }
-    let mut card = id.contact_card(row.username);
-    // Свежий предключ в карточке позволяет начать переписку даже без релея.
-    let (spk, _) = messaging::ensure_signed_prekey(db, &id)?;
-    card.signed_prekey = Some(messaging::signed_prekey_wire(&spk));
+    let (list, list_wire) = devices::own_list(db, &id)?;
+    let mut card = if id.device_id() == PRIMARY_DEVICE {
+        let mut card = id.contact_card(row.username);
+        // Свежий предключ в карточке позволяет начать переписку даже без релея.
+        let (spk, _) = messaging::ensure_signed_prekey(db, &id)?;
+        card.signed_prekey = Some(messaging::signed_prekey_wire(&spk));
+        card
+    } else {
+        // Предключ принадлежит устройству №1, поэтому в такой карточке его нет.
+        let primary = list
+            .device(PRIMARY_DEVICE)
+            .context("в списке устройств нет основного устройства")?;
+        id.account_contact_card(row.username, primary.x25519_pub)?
+    };
     // Список устройств: собеседник сразу будет писать на все.
-    card.devices = Some(devices::own_list(db, &id)?.1);
+    card.devices = Some(list_wire);
     let json = serde_json::to_string_pretty(&card)?;
     match out {
         Some(path) => {
@@ -1103,8 +1113,8 @@ fn cmd_link_approve(
     yes: bool,
 ) -> Result<()> {
     let (row, me) = load_identity(db)?;
-    if me.device_id() != PRIMARY_DEVICE {
-        bail!("подключать устройства может только основное устройство аккаунта");
+    if !me.has_account_key() {
+        bail!("подключать устройства может только устройство с ключом аккаунта");
     }
     let req = LinkRequest::decode(code)?;
     let (x25519_pub, ed25519_pub) = req.keys()?;
@@ -1138,20 +1148,8 @@ fn cmd_link_approve(
         }
     }
 
-    list.version += 1;
-    // Номер не должен совпасть с номером уже отключённого устройства, а в списке
-    // отключённых нет. Версия списка растёт при каждом изменении (и добавлении, и
-    // отключении), поэтому номер не меньше новой версии никогда не повторится.
-    let by_version = u32::try_from(list.version).context("слишком много изменений списка")?;
-    let after_max = list
-        .devices
-        .iter()
-        .map(|d| d.device_id)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .context("закончились номера устройств")?;
-    let device_id = by_version.max(after_max);
+    let (version, device_id) = devices::next_device_number(&list)?;
+    list.version = version;
     list.devices.push(DeviceInfo {
         device_id,
         x25519_pub,
@@ -1324,8 +1322,8 @@ fn cmd_link_finish(db: &Db, response: Option<String>, file: Option<PathBuf>) -> 
 /// перестанет пускать, собеседники перестанут ему писать.
 fn cmd_unlink(db: &Db, relay: &str, device_id: u32) -> Result<()> {
     let (_, me) = load_identity(db)?;
-    if me.device_id() != PRIMARY_DEVICE {
-        bail!("отключать устройства может только основное устройство аккаунта");
+    if !me.has_account_key() {
+        bail!("отключать устройства может только устройство с ключом аккаунта");
     }
     if device_id == PRIMARY_DEVICE {
         bail!("основное устройство отключить нельзя: его ключ — это ключ аккаунта");
